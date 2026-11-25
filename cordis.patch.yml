@@ -1,0 +1,9 @@
+# dsh-connect-model-gateway bundle patch
+#
+# 一个 Host 插件行。浏览器半边由 package.json 的 dsh.client 声明，
+# 经 exports["./client"] 提供给页面。
+#
+# 行名必须等于包名——Host loader 通过 node_modules 解析它。
+- insert:
+    - id: dsh-connect-model-gateway
+      name: 'dsh-connect-model-gateway'

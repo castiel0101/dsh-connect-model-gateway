@@ -1,0 +1,6 @@
+node_modules/
+.DS_Store
+*.tgz
+*.log
+交接说明.md
+借鉴清单.md
