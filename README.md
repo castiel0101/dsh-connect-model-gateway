@@ -46,7 +46,7 @@ dsh plugin --profile desktop add /绝对路径/dsh-connect-model-gateway
 | WorkBuddy（腾讯 CodeBuddy） | `workbuddy` | 读桌面客户端凭证，或浏览器登录一次 | 剩余 / 总额 / 套餐 / 周期 | 每日签到，连续天数 |
 | CodeArts（华为云） | `codearts` | 华为云 OAuth2 PKCE + DPoP | 剩余额度 | 每日领取 |
 | Meoo 秒悟 | `meoo` | 浏览器 OAuth(PKCE)，或粘 `meoo_ak_…` API Key | 剩余积分 | 登录即送 2000/天，只检测不代领 |
-| SCNet | `scnet` | 手机号 + 短信验证码 | 无余额接口，显示「未知」 | 无 |
+| SCNet | `scnet` | 手机号 + 短信验证码 | 无余额接口、不扣积分，显示 ♾️ 不限量 | 无 |
 | WPS 灵犀 | `lingxi` | 独立临时浏览器窗口登录，插件只读 `wps_sid` | 智点，15 天内过期提示 | 任务领取 |
 
 provider 键沿用旧插件的值，改名时未改动，已有会话的模型引用继续有效。
