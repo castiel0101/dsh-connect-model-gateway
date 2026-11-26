@@ -1,6 +1,6 @@
 # 魔桥 · dsh-connect-model-gateway
 
-把 WorkBuddy、华为云 CodeArts、Meoo 秒悟、SCNet、WPS 灵犀接进 DeepSeek Harness（DSH），在 DSH 里直接调用这些平台的模型。
+把 WorkBuddy、华为云 CodeArts、Meoo 秒悟、SCNet、WPS 灵犀、商汤小浣熊接进 DeepSeek Harness（DSH），在 DSH 里直接调用这些平台的模型。
 
 包名 `dsh-connect-model-gateway`，设置页入口名为「魔桥」。
 
@@ -12,7 +12,7 @@
 - **模型目录与开关**：启动和每小时各拉一次上游模型目录。模型默认不勾选，勾选过的才进 DSH 选择器；可逐模型设置上下文窗口、图片输入、思考档位。
 - **自动签到**：每小时检查一次，每个账号每天签一次；支持单个补签和一键全部签到，失败按退避重试。
 - **会话区积分胶囊**：当前会话选中魔桥的模型时，输入框旁显示「剩余积分 + 更新 HH:MM」。选中其他 provider 的模型时不显示。
-- **多平台并存**：五个 provider 各自注册，同一对话里可以分别选不同平台的模型，互不干扰。
+- **多平台并存**：六个 provider 各自注册，同一对话里可以分别选不同平台的模型，互不干扰。
 - **不占用其他插件的槽位**：模型行显示由 DSH 原生组件负责，本插件不注册 `conversation.input.model.label`。
 
 ## 安装
@@ -48,12 +48,13 @@ dsh plugin --profile desktop add /绝对路径/dsh-connect-model-gateway
 | Meoo 秒悟 | `meoo` | 浏览器 OAuth(PKCE)，或粘 `meoo_ak_…` API Key | 剩余积分 | 登录即送 2000/天，只检测不代领 |
 | SCNet | `scnet` | 手机号 + 短信验证码 | 无余额接口、不扣积分，显示 ♾️ 不限量 | 无 |
 | WPS 灵犀 | `lingxi` | 独立临时浏览器窗口登录，插件只读 `wps_sid` | 智点，15 天内过期提示 | 任务领取 |
+| 商汤小浣熊 | `raccoon` | 独立临时浏览器窗口，微信扫码登录 | 可用积分 | 无 |
 
 provider 键沿用旧插件的值，改名时未改动，已有会话的模型引用继续有效。
 
 ## 架构
 
-五个平台的登录、余额、目录、签到、设置页各实现一次，平台差异收敛在适配器层。适配器无状态：凭证由 manager 传入，数据返回；账号池、切换、持久化在 `lib/core/manager.js`。
+六个平台的登录、余额、目录、签到、设置页各实现一次，平台差异收敛在适配器层。适配器无状态：凭证由 manager 传入，数据返回；账号池、切换、持久化在 `lib/core/manager.js`。
 
 ```
 DSH 对话窗口
@@ -80,6 +81,7 @@ lib/
   core/workbuddy-shim.js    WorkBuddy 本地转发端点（信封归一化 + 重试阶梯）
   core/lingxi-shim.js       灵犀三步握手 + SSE 翻译
   core/retry-fetch.js       SCNet 四类抖动归一化 + context 净化
+  adapters/raccoon.js       小浣熊适配器（直连网关，浏览器扫码登录）
   adapters/*.js             每平台一个无状态适配器
 ```
 
@@ -152,21 +154,44 @@ macOS 凭证路径：`~/Library/Application Support/CodeBuddyExtension/Data/Publ
 
 SSE 正文在 `choices[].text`，不是 `delta.content`，也没有 `[DONE]`，tool_calls 按 index 聚合。请求体需归一：分段 content 展平成字符串，对象形式的 `tool_choice` 转成字符串，否则 400 InvalidArgument。
 
+### 商汤小浣熊
+
+| 用途 | 端点 |
+|---|---|
+| 登录 | 微信扫码。插件起一个临时 profile 浏览器打开工作台，二维码由小浣熊页面自己渲染，登录完成后插件读回 `access_token` |
+| 推理 | `POST https://xiaohuanxiong.com/api/web/llm/v2/chat/completions`（OpenAI 兼容，直连） |
+| 模型目录 | `GET /api/web/llm/v2/model_catalog` → `data.categories[type=chat].models[]` |
+| 积分 | `GET /api/web/points/v1/balance` → `data.available_points` |
+| 签到 | 无 |
+
+请求头要带 `X-Org-Code: ''`（个人版正常值）、`X-Raccoon-Language: zh`、`X-Client-Platform: web`，认证是 `Authorization: Bearer <access_token>`；只带 cookie 不带 Bearer 会回 `200001 authorization_empty_error`。
+
+登录接口 `POST /api/iam/v1/auth/mp/qrcode` 返回的 `scan_path` 是 `/login/mp`，是微信小程序页面路径，不是图片地址也不是 H5 落地页 —— 用它拼 URL 的三种写法都 404，抓包里也没有图片响应。小程序码只能由微信服务端生成，插件画不出来，所以走浏览器方案，二维码交给小浣熊自己的页面。
+
+网页版登录只返回 `access_token`，**没有 refresh_token**，实测有效期 30 天（`exp - iat = 720h`），旧插件文档写的 3 小时是桌面端口径。因此不做静默续期，过期后重新扫码即可。
+
+token 还跟登录会话绑定：同一个账号在别处重新登录（或网页端刷新了会话）之后，旧 token 会立刻变成 `401 200003 authorization_verify_error`，不是等到 `exp` 才失效。所以「未到期」不等于「还能用」，`probe` 以真实请求结果为准。
+
+目录里 `visible: false` 的 `raccoon-xxxxxx` 是 App 内建路由位，不是能对话的模型，过滤掉。倍率取 `billing_effective_multiplier`（促销时用折后价），`billing_status: limited_free` 且倍率为 0 的显示「限时免费」。模型识图能力按实测结论写死：GLM-5.3 目录标着 vision 却看不了图，GLM-5.3-Flash 与 DeepSeek-V4.1-Flash 没标却能看。
+
+业务错误码按 HTTP 语义归一：会话失效 `200001/200003/200822` → 401，额度耗尽 `200402/200429/100402` → 402，限流文案 → 429。上游多数失败是 400 加业务码，先读 code 再看 status。
+
 ## 已知限制
 
-- 五个平台都没有公开 API，本插件调用的是客户端和网页在用的私有接口。上游改动会导致对应平台失效；修复取决于社区跟进。
+- 六个平台都没有公开 API，本插件调用的是客户端和网页在用的私有接口。上游改动会导致对应平台失效；修复取决于社区跟进。
 - 自动签到、token 续期、多账号切换、复用浏览器 cookie 可能被平台识别为非官方客户端，后果从重新登录到停号、清积分不等。企业版 / 教育版席位的权益规则另算。
 - 账号与凭证明文存放在 `~/.dsh/model-pool/*.json`（`0600`）。不要同步到网盘，不要在公用机器上使用。插件没有后端，不上传凭证。
 - 推理按各平台倍率扣使用者账号的积分，签到奖励不可撤销。不自动换号，不跨模型 failover。
 - 各平台积分单位不同，界面按各自原值显示，不做换算。
 - CodeArts、WorkBuddy、灵犀在 `127.0.0.1` 起临时转发端点，随机 bearer + Host 校验，进程退出即关闭；同机同用户的其他进程理论上可访问。
 - 适配器互相独立，一家失效不会拖垮其他平台；上游改接口需按平台逐个跟进。
+- 小浣熊网页登录态有效期 30 天且没有 refresh_token，只能重新扫码；登录用的临时浏览器窗口在插件设置页点「扫码登录」时拉起，卸载插件会把残留窗口和临时 profile 一起收掉。
 
 ## 免责声明
 
 - 本项目仅供个人学习和研究使用，只驱动使用者自己的账号在本机调用，请勿用于商业用途。
 - 使用者需遵守各平台的服务条款；因使用本项目产生的账号限制、服务中断等后果由使用者自行承担。
-- 本项目与 WorkBuddy / 腾讯、华为云 CodeArts、Meoo 秒悟、SCNet、WPS 灵犀均无关联，未获授权或认可；文中出现的名称仅用于描述兼容关系，商标权利归各自所有。
+- 本项目与 WorkBuddy / 腾讯、华为云 CodeArts、Meoo 秒悟、SCNet、WPS 灵犀、商汤小浣熊 / 商汤均无关联，未获授权或认可；文中出现的名称仅用于描述兼容关系，商标权利归各自所有。
 - 项目按 MIT 许可证发布，不提供保修。
 
 ## 致谢
@@ -180,6 +205,7 @@ SSE 正文在 `choices[].text`，不是 `delta.content`，也没有 `[DONE]`，t
 | Meoo 秒悟 | [xinstart-1/dsh-connect-meoo](https://github.com/xinstart-1/dsh-connect-meoo) | 浏览器 OAuth(PKCE) 登录、API Key 转项目服务 AK、富目录 id 取值规则 |
 | SCNet | [Phoeky/dsh-scnet-connect](https://github.com/Phoeky/dsh-scnet-connect) | 手机号+验证码登录、SCNet-Max 基座实测结论、四类请求抖动归一化 |
 | WPS 灵犀 | [xinstart-1/dsh-connect-lingxi](https://github.com/xinstart-1/dsh-connect-lingxi) | 独立浏览器 profile 登录、三步握手与 SSE 翻译、请求体归一 |
+| 商汤小浣熊 | [zhlcba/dsh-raccoon-connect](https://github.com/zhlcba/dsh-raccoon-connect) | 上游协议实测记录（`docs/upstream-protocol.md`）、错误码分类、模型识图实测结论、目录 `billing_*` 字段解析 |
 
 以上项目均为 MIT 开源。相关算法和实测结论的著作权归各自原作者。
 
