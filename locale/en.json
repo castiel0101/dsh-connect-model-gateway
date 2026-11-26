@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Model Gateway",
-    "description": "All points-for-models platforms in one plugin: WorkBuddy, CodeArts, Meoo, SCNet, Lingxi and SenseTime Raccoon. Shared sign-in and account pool, credit balances, model catalog and toggles, automatic daily check-in; chosen models appear straight in the DSH model selector."
+    "description": "One plugin for every points-for-models platform: WorkBuddy, CodeArts, Meoo, SCNet, WPS Lingxi and SenseTime Raccoon. Shared login and account pool, balances, model catalog and switches, auto check-in; enabled models appear in the DSH model picker. Auto mode falls back along a platform + account + model priority chain when a candidate is rate-limited, out of quota, or signed out."
   }
 }

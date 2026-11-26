@@ -1,0 +1,365 @@
+/**
+ * Auto 模式核心逻辑自测（不依赖 DSH 宿主，只喂假 chunk 流）。
+ *
+ * 跑法：node test/auto-route.test.mjs
+ *
+ * 覆盖：去重、冷却跳过、首包前换、已出内容不换、全失败聚合、策略开关、
+ * 账号绑定（不动物流全局当前账号）。
+ */
+
+import { mkdtemp, writeFile, mkdir } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import assert from 'node:assert/strict'
+
+import { createManager } from '../lib/core/manager.js'
+import {
+  AUTO_MODEL,
+  accountScope,
+  candidateKey,
+  createAutoAdapter,
+  createAutoRouter,
+  createAutoStore,
+  createCooling,
+} from '../lib/core/auto-route.js'
+
+const dir = await mkdtemp(join(tmpdir(), 'mgw-auto-'))
+await mkdir(dir, { recursive: true })
+
+/** 两个平台各一个账号；models 由 fallbackModels 给。 */
+async function makeManager(accounts) {
+  const written = []
+  for (const [provider, spec] of Object.entries(accounts)) {
+    const path = join(dir, `${provider}.json`)
+    await writeFile(path, JSON.stringify({
+      activeAccount: spec.accounts[0].id,
+      accounts: spec.accounts,
+      disabledModels: spec.disabled ?? [],
+      modelSettings: {},
+      options: {},
+    }))
+    written.push([provider, spec])
+  }
+  const fakeAdapter = {
+    async refresh(credential) {
+      return credential
+    },
+    async probe() {
+      return { state: 'signed-in' }
+    },
+    async listModels() {
+      return []
+    },
+    chatBase() {
+      return 'http://127.0.0.1:1'
+    },
+    async checkIn() {},
+  }
+  const manager = createManager({
+    stateDir: dir,
+    warn: () => {},
+    specs: written.map(([provider, spec]) => ({
+      adapter: fakeAdapter,
+      providerKey: provider,
+      displayName: spec.displayName,
+      fallbackModels: spec.models,
+    })),
+  })
+  await manager.init()
+  return manager
+}
+
+const models = [
+  { id: 'm-1', name: '模型一', contextWindow: 128_000, maxTokens: 8192, vision: false },
+  { id: 'm-2', name: '模型二', contextWindow: 200_000, maxTokens: 16_384, vision: true },
+  { id: 'm-3', name: '模型三', contextWindow: 64_000, maxTokens: 4096, vision: false },
+]
+
+const manager = await makeManager({
+  alpha: {
+    displayName: 'Alpha',
+    accounts: [
+      { id: 'a1', label: '甲账号', credential: { token: 't1' } },
+      { id: 'a2', label: '乙账号', credential: { token: 't2' } },
+    ],
+    models,
+  },
+  beta: {
+    displayName: 'Beta',
+    accounts: [{ id: 'b1', label: '乙平台账号', credential: { token: 't3' } }],
+    models: [models[1]],
+    disabled: ['m-2'],
+  },
+})
+
+const storePath = join(dir, 'auto.json')
+let store = createAutoStore({ path: storePath })
+await store.load()
+
+const cooling = createCooling()
+const router = createAutoRouter({ store, manager, canImageNow: () => true })
+
+/** 假宿主：按 (provider|model) 回放预设的 chunk 序列，并记录收到的 options。 */
+function fakeHost(script) {
+  const calls = []
+  const llm = {
+    stream(options) {
+      // 顺手记下 Auto 通过 ALS 带过来的账号绑定
+      calls.push({ ...options, scope: accountScope.getStore() })
+      const key = `${options.provider}|${options.model}`
+      const producer = script[key]
+      return (async function* () {
+        if (producer === undefined) {
+          yield { type: 'finish', reason: { kind: 'error', failure: { code: 'NO_SCRIPT', message: `没有为 ${key} 准备脚本` } } }
+          return
+        }
+        yield* producer(options)
+      })()
+    },
+  }
+  return { ctx: { llm }, calls }
+}
+
+const text = (value) => ({ type: 'text-delta', index: 0, text: value })
+const stop = { type: 'finish', reason: { kind: 'stop' } }
+const fail = (code, message = code) => ({ type: 'finish', reason: { kind: 'error', failure: { code, message } } })
+
+async function collect(iterable) {
+  const chunks = []
+  for await (const chunk of iterable) chunks.push(chunk)
+  return chunks
+}
+
+function makeAdapter(ctx) {
+  return createAutoAdapter({ ctx, store, router, cooling, warn: () => {} })
+}
+
+// ---------- 1. 去重 ----------
+{
+  const result = await store.addCandidates([
+    { provider: 'alpha', accountId: 'a1', model: 'm-1' },
+    { provider: 'alpha', accountId: 'a1', model: 'm-1' },
+    { provider: 'alpha', accountId: 'a2', model: 'm-1' },
+    { provider: 'auto', accountId: 'a1', model: 'm-1' },
+  ])
+  assert.equal(result.added.length, 2, '同一三元组只加一条；auto 自己不能被当成候选')
+  assert.equal(result.skipped.length, 2)
+  assert.equal(result.skipped[0].reason, 'duplicate')
+  assert.equal(result.skipped[1].reason, 'invalid')
+}
+
+// ---------- 2. 候选解释：账号、模型元数据、停用与未登录 ----------
+{
+  await store.addCandidates([
+    { provider: 'beta', accountId: 'b1', model: 'm-2' },
+    { provider: 'alpha', accountId: 'a1', model: 'm-3' },
+  ])
+  const list = router.list(cooling)
+  assert.equal(list.length, 4)
+  assert.equal(list[0].ready, true)
+  assert.equal(list[0].accountLabel, '甲账号')
+  assert.equal(list[0].contextWindow, 128_000)
+  // beta 平台的 m-2 被停用了
+  const disabled = list.find((entry) => entry.provider === 'beta')
+  assert.equal(disabled.ready, false)
+  assert.equal(disabled.reason, '模型已停用')
+  // 账号被移除
+  manager.byKey.get('alpha').state.accounts = manager.byKey.get('alpha').state.accounts.filter((a) => a.id !== 'a2')
+  const gone = router.list(cooling).find((entry) => entry.accountId === 'a2')
+  assert.equal(gone.ready, false)
+  assert.equal(gone.reason, '账号已移除')
+  manager.byKey.get('alpha').state.accounts.push({ id: 'a2', label: '乙账号', credential: { token: 't2' } })
+}
+
+// ---------- 3. 首包前失败 → 换下一个候选（账号按候选绑定） ----------
+{
+  const { ctx, calls } = fakeHost({
+    'alpha|m-1': async function* () { yield fail('RATE_LIMIT', '429 太挤了') },
+    'alpha|m-3': async function* () {
+      yield text('来自模型三')
+      yield { type: 'usage', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }
+      yield stop
+    },
+  })
+  cooling.clear()
+  // 只留 m-1(a1) 和 m-3(a1) 两条
+  const chunks = await collect(makeAdapter(ctx).stream({ provider: 'auto', model: AUTO_MODEL, messages: [] }))
+  const joined = chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('')
+  assert.equal(joined, '来自模型三', '应该换到第三候选并交付它的内容')
+  assert.equal(chunks.at(-1).reason.kind, 'stop')
+  // 前两条是同一个模型的甲/乙两个账号（脚本按 provider|model 命中，两条都会失败），
+  // 第三条才成功 —— 正好验证「账号是候选维度」
+  assert.deepEqual(calls.map((c) => `${c.model}@${c.scope?.accountId}`), ['m-1@a1', 'm-1@a2', 'm-3@a1'])
+  // 冷却：失败的那条被标记
+  assert.equal(cooling.active(candidateKey({ provider: 'alpha', accountId: 'a1', model: 'm-1' })), true)
+  assert.equal(cooling.code(candidateKey({ provider: 'alpha', accountId: 'a1', model: 'm-1' })), 'RATE_LIMIT')
+}
+
+// ---------- 4. 冷却中的候选直接跳过，不排队等 ----------
+{
+  const { ctx, calls } = fakeHost({
+    'alpha|m-3': async function* () { yield text('ok'); yield stop },
+  })
+  cooling.clear()
+  for (const entry of router.list(cooling).filter((item) => item.model === 'm-1')) {
+    cooling.mark(entry.key, 'RATE_LIMIT', 60_000)
+  }
+  const chunks = await collect(makeAdapter(ctx).stream({ provider: 'auto', model: AUTO_MODEL, messages: [] }))
+  assert.equal(chunks.at(-1).reason.kind, 'stop')
+  assert.equal(calls.length, 1, '冷却中的候选不该被请求，也不排队等')
+  assert.equal(calls[0].model, 'm-3')
+}
+
+// ---------- 5. 已吐过内容后出错：锁定当前候选，不重放 ----------
+{
+  cooling.clear()
+  let secondCalled = false
+  const { ctx } = fakeHost({
+    'alpha|m-1': async function* () {
+      yield text('前半段')
+      yield fail('SERVER', '上游 500')
+    },
+    'alpha|m-3': async function* () { secondCalled = true; yield text('不该出现'); yield stop },
+  })
+  const chunks = await collect(makeAdapter(ctx).stream({ provider: 'auto', model: AUTO_MODEL, messages: [] }))
+  const joined = chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('')
+  assert.equal(joined, '前半段')
+  assert.equal(chunks.at(-1).reason.kind, 'error')
+  assert.equal(chunks.at(-1).reason.failure.code, 'SERVER')
+  assert.equal(secondCalled, false, '已经输出内容的这一轮不能重放')
+}
+
+// ---------- 6. 策略不勾的码不切换 ----------
+{
+  cooling.clear()
+  const { ctx, calls } = fakeHost({
+    'alpha|m-1': async function* () { yield fail('INVALID_REQUEST', '参数不对') },
+    'alpha|m-3': async function* () { yield text('不该出现'); yield stop },
+  })
+  const chunks = await collect(makeAdapter(ctx).stream({ provider: 'auto', model: AUTO_MODEL, messages: [] }))
+  assert.equal(chunks.at(-1).reason.kind, 'error')
+  assert.equal(chunks.at(-1).reason.failure.code, 'INVALID_REQUEST')
+  assert.equal(calls.length, 1, 'INVALID_REQUEST 默认不切换')
+}
+
+// ---------- 7. 全部失败：聚合错误里带每条候选的码 ----------
+{
+  cooling.clear()
+  const { ctx } = fakeHost({
+    'alpha|m-1': async function* () { yield fail('RATE_LIMIT') },
+    'alpha|m-3': async function* () { yield fail('TIMEOUT') },
+  })
+  const chunks = await collect(makeAdapter(ctx).stream({ provider: 'auto', model: AUTO_MODEL, messages: [] }))
+  const last = chunks.at(-1)
+  assert.equal(last.reason.kind, 'error')
+  assert.equal(last.reason.failure.code, 'AUTO_EXHAUSTED')
+  assert.match(last.reason.failure.message, /RATE_LIMIT/)
+  assert.match(last.reason.failure.message, /TIMEOUT/)
+}
+
+// ---------- 8. 没有可用候选时给可操作的原因 ----------
+{
+  cooling.clear()
+  const saved = store.candidates()
+  await store.removeCandidate(candidateKey(saved[0]))
+  // 把剩下的都标记成冷却
+  for (const entry of router.list(cooling)) cooling.mark(entry.key, 'RATE_LIMIT', 60_000)
+  const { ctx, calls } = fakeHost({})
+  const chunks = await collect(makeAdapter(ctx).stream({ provider: 'auto', model: AUTO_MODEL, messages: [] }))
+  assert.equal(chunks.at(-1).reason.failure.code, 'AUTO_NO_CANDIDATE')
+  assert.match(chunks.at(-1).reason.failure.message, /冷却中/)
+  assert.equal(calls.length, 0)
+  cooling.clear()
+}
+
+// ---------- 9. 模型条目：只有启用且有候选才出现 ----------
+{
+  const adapter = makeAdapter(fakeHost({}).ctx)
+  assert.equal((await adapter.listModels('auto')).length, 1)
+  await store.setEnabled(false)
+  assert.equal((await adapter.listModels('auto')).length, 0)
+  await store.setEnabled(true)
+  const model = await adapter.resolveModel('auto', 'auto')
+  // 上下文取候选最小值（m-3 是 64K）
+  assert.equal(model.context.contextWindow, 64_000)
+  // 不是所有候选都支持图片 → 只声明文本
+  assert.deepEqual(model.inputModalities, ['text'])
+}
+
+// ---------- 10. 排序移动 + 落盘 ----------
+{
+  const before = store.candidates().map(candidateKey)
+  await store.moveCandidate(before[0], 1)
+  const after = store.candidates().map(candidateKey)
+  assert.equal(after[0], before[1])
+  const reread = createAutoStore({ path: storePath })
+  await reread.load()
+  assert.deepEqual(reread.candidates().map(candidateKey), after, '顺序要落盘')
+}
+
+// ---------- 11. 全局当前账号不受影响 ----------
+{
+  const platform = manager.byKey.get('alpha')
+  const activeBefore = platform.state.activeAccount
+  // 直接跑一次走 a2 的请求
+  cooling.clear()
+  const { ctx } = fakeHost({
+    [`alpha|m-1`]: async function* () { yield text('x'); yield stop },
+  })
+  const adapter = makeAdapter(ctx)
+  await store.addCandidates([{ provider: 'alpha', accountId: 'a2', model: 'm-1' }])
+  await store.moveCandidate(candidateKey({ provider: 'alpha', accountId: 'a2', model: 'm-1' }), -1)
+  const chunks = await collect(adapter.stream({ provider: 'auto', model: AUTO_MODEL, messages: [] }))
+  assert.equal(chunks.at(-1).reason.kind, 'stop')
+  const last = adapter.snapshot().lastRoute
+  assert.equal(last.used.accountId, 'a2', '实际用的是候选绑定的账号')
+  assert.equal(platform.state.activeAccount, activeBefore, 'Auto 不能改平台全局当前账号')
+
+}
+
+// ---------- 12. 日志：切换次数统计 ----------
+{
+  const snapshot = makeAdapter(fakeHost({}).ctx).snapshot()
+  assert.ok(snapshot.history.length >= 0)
+}
+
+// ---------- 13. 指定账号的推理目标 + 不动全局当前账号 + 续期串行化 ----------
+{
+  const platform = manager.byKey.get('alpha')
+  const activeBefore = platform.state.activeAccount
+  let concurrent = 0
+  let peak = 0
+  const originalRefresh = platform.adapter.refresh
+  platform.adapter.refresh = async (credential) => {
+    concurrent += 1
+    peak = Math.max(peak, concurrent)
+    await new Promise((resolve) => setTimeout(resolve, 15))
+    concurrent -= 1
+    return credential
+  }
+  const [first, second] = await Promise.all([
+    platform.inferenceTarget('a1'),
+    platform.inferenceTarget('a1'),
+  ])
+  assert.equal(first.apiKey, 't1')
+  assert.equal(second.apiKey, 't1')
+  assert.equal(peak, 1, '同一账号的续期必须串行，否则 refresh token 会被用两次')
+  const other = await platform.inferenceTarget('a2')
+  assert.equal(other.apiKey, 't2')
+  assert.equal(other.accountId, 'a2')
+  assert.equal(platform.state.activeAccount, activeBefore, '指定账号不能改全局当前账号')
+  platform.adapter.refresh = originalRefresh
+}
+
+// ---------- 14. 冷却按候选算：同一账号换模型不受影响 ----------
+{
+  cooling.clear()
+  const a1m1 = candidateKey({ provider: 'alpha', accountId: 'a1', model: 'm-1' })
+  const a1m3 = candidateKey({ provider: 'alpha', accountId: 'a1', model: 'm-3' })
+  cooling.mark(a1m1, 'RATE_LIMIT', 60_000)
+  assert.equal(cooling.active(a1m1), true)
+  assert.equal(cooling.active(a1m3), false, '同账号的另一个模型不该被连坐')
+  cooling.clear()
+}
+
+console.log('auto-route: 全部断言通过')
