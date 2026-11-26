@@ -158,7 +158,7 @@ SSE 正文在 `choices[].text`，不是 `delta.content`，也没有 `[DONE]`，t
 
 | 用途 | 端点 |
 |---|---|
-| 登录 | 微信扫码。插件起一个临时 profile 浏览器打开工作台，二维码由小浣熊页面自己渲染，登录完成后插件读回 `access_token` |
+| 登录 | 微信扫码。插件起一个临时 profile 浏览器打开 `https://xiaohuanxiong.com/login?product_code=work&redirect_url=…`，扫码后跳回工作台，二维码由小浣熊页面自己渲染，登录完成后插件读回 `access_token` |
 | 推理 | `POST https://xiaohuanxiong.com/api/web/llm/v2/chat/completions`（OpenAI 兼容，直连） |
 | 模型目录 | `GET /api/web/llm/v2/model_catalog` → `data.categories[type=chat].models[]` |
 | 积分 | `GET /api/web/points/v1/balance` → `data.available_points` |
