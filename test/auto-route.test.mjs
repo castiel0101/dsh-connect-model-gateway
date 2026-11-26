@@ -295,6 +295,18 @@ function makeAdapter(ctx) {
   const reread = createAutoStore({ path: storePath })
   await reread.load()
   assert.deepEqual(reread.candidates().map(candidateKey), after, '顺序要落盘')
+
+  // reorderCandidate：把第 2 条直接拖到第 0 位
+  const full = store.candidates().map(candidateKey)
+  assert.equal(await store.reorderCandidate(full[2], 0), true)
+  assert.equal(candidateKey(store.candidates()[0]), full[2], '拖拽后应落到指定位置')
+  const reread2 = createAutoStore({ path: storePath })
+  await reread2.load()
+  assert.equal(candidateKey(reread2.candidates()[0]), full[2], '拖拽排序要落盘')
+
+  // 复原顺序，后面用例依赖初始排列
+  await store.reorderCandidate(full[2], 2)
+  assert.deepEqual(store.candidates().map(candidateKey), full, '复原顺序')
 }
 
 // ---------- 11. 全局当前账号不受影响 ----------
