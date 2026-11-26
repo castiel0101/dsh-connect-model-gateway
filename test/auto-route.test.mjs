@@ -362,4 +362,50 @@ function makeAdapter(ctx) {
   cooling.clear()
 }
 
+// ---------- 15. 外部 provider（DSH 自带 / 用户自配）候选 ----------
+{
+  // 造一个假的外部目录：deepseek-account 有两个模型，其中 claude 支持图片
+  const fakeExternal = {
+    get(provider) {
+      if (provider !== 'deepseek-account') return undefined
+      return {
+        id: provider,
+        name: 'DeepSeek 账号',
+        models: new Map([
+          ['native-1', { id: 'native-1', name: '原生模型一', contextWindow: 64_000, maxTokens: 4096, vision: false, thinkingOptions: [], badge: undefined }],
+          ['native-2', { id: 'native-2', name: '原生模型二', contextWindow: 256_000, maxTokens: 8192, vision: true, thinkingOptions: ['high'], badge: 'x1' }],
+        ]),
+      }
+    },
+  }
+  const externalRouter = createAutoRouter({ store, manager, external: fakeExternal, canImageNow: () => true })
+  const described = externalRouter.describe({ provider: 'deepseek-account', accountId: '', model: 'native-2' })
+  assert.equal(described.ready, true)
+  assert.equal(described.providerName, 'DeepSeek 账号')
+  assert.equal(described.external, true)
+  assert.equal(described.accountLabel, '')
+  assert.equal(described.modelName, '原生模型二')
+  assert.equal(described.contextWindow, 256_000)
+  // 不存在的 provider 或模型仍然报清楚原因
+  assert.equal(externalRouter.describe({ provider: 'nope', accountId: '', model: 'x' }).reason, '平台未接入')
+  assert.equal(externalRouter.describe({ provider: 'deepseek-account', accountId: '', model: 'nope' }).reason, '模型不在目录里')
+
+  // 真跑一次：外部候选 shouldn't 需要账号上下文，也不该被 ALS 强行注入魔桥账号
+  const isolated = createAutoStore({ path: join(dir, 'auto-external.json') })
+  await isolated.load()
+  await isolated.addCandidates([{ provider: 'deepseek-account', accountId: '', model: 'native-1' }])
+  const extCooling = createCooling()
+  const extRouter = createAutoRouter({ store: isolated, manager, external: fakeExternal })
+  const { ctx, calls } = fakeHost({
+    'deepseek-account|native-1': async function* () { yield text('来自原生'); yield stop },
+  })
+  const extAdapter = createAutoAdapter({ ctx, store: isolated, router: extRouter, cooling: extCooling, warn: () => {} })
+  const chunks = await collect(extAdapter.stream({ provider: 'auto', model: AUTO_MODEL, messages: [] }))
+  assert.equal(chunks.at(-1).reason.kind, 'stop')
+  assert.equal(chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join(''), '来自原生')
+  assert.equal(calls[0].provider, 'deepseek-account')
+  assert.equal(calls[0].model, 'native-1')
+  assert.equal(calls[0].scope?.accountId, '', '外部候选的 accountId 必须是空串，不能误用魔桥账号')
+}
+
 console.log('auto-route: 全部断言通过')
