@@ -65,6 +65,15 @@
     "aliasPlaceholder": "e.g. gpt-4o",
     "targetPlaceholder": "mg-auto or mg-workbuddy:model",
     "warning": "⚠ These six platforms are private APIs billed to your own accounts; for personal research only, no commercial use.",
-    "errorPrefix": "Gateway error: "
+    "errorPrefix": "Gateway error: ",
+    "models": "Models",
+    "modelsHint": "Every enabled model is listed here. Type an alias in its row and press Enter — no per-alias dialog needed.",
+    "platform": "Platform",
+    "contextWindow": "Context",
+    "capability": "Capabilities",
+    "vision": "Vision",
+    "thinking": "Thinking",
+    "tools": "Tools",
+    "noModels": "No models enabled yet. Tick some in the platform tabs first."
   }
 }

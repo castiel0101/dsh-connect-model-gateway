@@ -195,6 +195,31 @@ await test('parseModel knownProviders: 未知 provider 400、已知通过、不�
   assert.deepEqual(parseModel('mg-nope:gpt-4o', {}, undefined), { provider: 'nope', actualModel: 'gpt-4o' })
 })
 
+await test('modelsList: 上下文窗口与能力字段（有值才输出，不编造）', () => {
+  const list = modelsList([
+    'mg-auto',
+    {
+      id: 'mg-workbuddy:claude-sonnet-4',
+      owned_by: 'workbuddy',
+      context_length: 200000,
+      max_output_tokens: 8192,
+      supports_vision: true,
+      supports_tools: true,
+      supports_reasoning: false,
+    },
+    { id: 'mg-scnet:SCNet-Max', context_length: 0, supports_vision: 'yes' },
+  ])
+  assert.deepEqual(Object.keys(list.data[0]).sort(), ['created', 'id', 'object', 'owned_by'])
+  const rich = list.data[1]
+  assert.equal(rich.context_length, 200000)
+  assert.equal(rich.max_output_tokens, 8192)
+  assert.equal(rich.supports_vision, true)
+  assert.equal(rich.supports_tools, true)
+  assert.equal(rich.supports_reasoning, false)
+  // 非法值（0 / 非 boolean）必须丢掉，不能把 'yes' 塞给调用方
+  assert.deepEqual(Object.keys(list.data[2]).sort(), ['created', 'id', 'object', 'owned_by'])
+})
+
 // -------------------------------------------------------- messages 各 role
 
 await test('messages: system/user 字符串 content', () => {
