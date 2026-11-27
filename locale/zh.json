@@ -57,13 +57,13 @@
     "done": "完成",
     "hashOnly": "只存 SHA-256 哈希",
     "aliases": "模型别名",
-    "aliasesHint": "前缀式 mg:provider:model 直接可用；别名给外部 Agent 稳定短名。",
+    "aliasesHint": "前缀式 mg-平台:模型 直接可用；别名给外部 Agent 稳定短名。",
     "alias": "别名",
     "target": "目标",
     "addAlias": "+ 新增别名",
     "addAliasTitle": "新增别名",
     "aliasPlaceholder": "如 gpt-4o",
-    "targetPlaceholder": "mg:auto 或 mg:workbuddy:模型名",
+    "targetPlaceholder": "mg-auto 或 mg-workbuddy:模型名",
     "warning": "⚠ 六家平台均为私有接口、按你自己的账号扣积分；仅供个人研究，请勿商用。",
     "errorPrefix": "网关错误："
   }

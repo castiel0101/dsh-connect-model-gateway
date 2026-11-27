@@ -98,7 +98,7 @@ const fakeImageResolver = (part) => ({
 /** 基础请求体。 */
 function baseBody(overrides = {}) {
   return {
-    model: 'mg:auto',
+    model: 'mg-auto',
     messages: [{ role: 'user', content: '你好' }],
     ...overrides,
   }
@@ -106,16 +106,16 @@ function baseBody(overrides = {}) {
 
 // ---------------------------------------------------------------- parseModel
 
-await test('parseModel: mg:auto', () => {
-  assert.deepEqual(parseModel('mg:auto'), { provider: 'auto', actualModel: 'auto' })
+await test('parseModel: mg-auto', () => {
+  assert.deepEqual(parseModel('mg-auto'), { provider: 'auto', actualModel: 'auto' })
 })
 
-await test('parseModel: mg:<provider>:<model>（model 里允许再带冒号）', () => {
-  assert.deepEqual(parseModel('mg:workbuddy:claude-sonnet-4'), {
+await test('parseModel: mg-<provider>:<model>（model 里允许再带冒号）', () => {
+  assert.deepEqual(parseModel('mg-workbuddy:claude-sonnet-4'), {
     provider: 'workbuddy',
     actualModel: 'claude-sonnet-4',
   })
-  assert.deepEqual(parseModel('mg:scnet:org/model:v2'), {
+  assert.deepEqual(parseModel('mg-scnet:org/model:v2'), {
     provider: 'scnet',
     actualModel: 'org/model:v2',
   })
@@ -123,7 +123,7 @@ await test('parseModel: mg:<provider>:<model>（model 里允许再带冒号）',
 
 await test('parseModel: 别名精确匹配（字符串 / 对象两种别名值）', () => {
   const aliases = {
-    'gpt-4o': 'mg:workbuddy:claude-sonnet-4',
+    'gpt-4o': 'mg-workbuddy:claude-sonnet-4',
     'fast': { provider: 'scnet', model: 'SCNet-Max' },
   }
   assert.deepEqual(parseModel('gpt-4o', aliases), {
@@ -133,15 +133,17 @@ await test('parseModel: 别名精确匹配（字符串 / 对象两种别名值�
   assert.deepEqual(parseModel('fast', aliases), { provider: 'scnet', actualModel: 'SCNet-Max' })
 })
 
-await test('parseModel: mg:auto:xxx 非法（auto 只有 auto 一个模型）', () => {
-  assert.deepEqual(parseModel('mg:auto:auto'), { provider: 'auto', actualModel: 'auto' })
-  assertProtocolError(() => parseModel('mg:auto:gpt-4o'), { status: 400, code: 'model_not_found' })
+await test('parseModel: mg-auto:xxx 非法（auto 不是平台通道，只有 mg-auto 自身）', () => {
+  // `mg-auto` 是完整 id，不接受再挂模型段
+  assert.deepEqual(parseModel('mg-auto'), { provider: 'auto', actualModel: 'auto' })
+  assertProtocolError(() => parseModel('mg-auto:auto'), { status: 400, code: 'model_not_found' })
+  assertProtocolError(() => parseModel('mg-auto:gpt-4o'), { status: 400, code: 'model_not_found' })
 })
 
 await test('parseModel: 别名链式展开 + Map 别名表', () => {
   const aliases = new Map([
     ['a', 'b'],
-    ['b', 'mg:auto'],
+    ['b', 'mg-auto'],
   ])
   assert.deepEqual(parseModel('a', aliases), { provider: 'auto', actualModel: 'auto' })
 })
@@ -151,8 +153,11 @@ await test('parseModel: 其它一律 400 model_not_found（禁止模糊匹配/�
   // 大小写不同不算命中
   assertProtocolError(() => parseModel('MG:AUTO'), { status: 400, code: 'model_not_found' })
   // 前缀不完整
-  assertProtocolError(() => parseModel('mg:workbuddy'), { status: 400, code: 'model_not_found' })
-  assertProtocolError(() => parseModel('mg::x'), { status: 400, code: 'model_not_found' })
+  assertProtocolError(() => parseModel('mg-workbuddy'), { status: 400, code: 'model_not_found' })
+  assertProtocolError(() => parseModel('mg-:x'), { status: 400, code: 'model_not_found' })
+  // 旧格式 mg: 已彻底废弃，必须拒绝（不保留兼容别名）
+  assertProtocolError(() => parseModel('mg:auto'), { status: 400, code: 'model_not_found' })
+  assertProtocolError(() => parseModel('mg:workbuddy:claude-sonnet-4'), { status: 400, code: 'model_not_found' })
   // 空值
   assertProtocolError(() => parseModel(''), { status: 400, code: 'model_not_found' })
   assertProtocolError(() => parseModel(undefined), { status: 400, code: 'model_not_found' })
@@ -166,14 +171,14 @@ await test('parseModel: 别名成环报 400（不递归到栈溢出）', () => {
 
 await test('parseModel knownProviders: 未知 provider 400、已知通过、不传保持旧行为', () => {
   const known = ['auto', 'workbuddy', 'scnet']
-  assert.deepEqual(parseModel('mg:workbuddy:claude-sonnet-4', {}, known), {
+  assert.deepEqual(parseModel('mg-workbuddy:claude-sonnet-4', {}, known), {
     provider: 'workbuddy',
     actualModel: 'claude-sonnet-4',
   })
-  assert.deepEqual(parseModel('mg:auto', {}, new Set(known)), { provider: 'auto', actualModel: 'auto' })
+  assert.deepEqual(parseModel('mg-auto', {}, new Set(known)), { provider: 'auto', actualModel: 'auto' })
 
   const unknown = assertProtocolError(
-    () => parseModel('mg:nope:gpt-4o', {}, known),
+    () => parseModel('mg-nope:gpt-4o', {}, known),
     { status: 400, param: 'model', code: 'model_not_found' },
   )
   assert.ok(unknown.message.includes('nope'))
@@ -181,20 +186,20 @@ await test('parseModel knownProviders: 未知 provider 400、已知通过、不�
 
   // 别名解析出来的 provider 也要过校验
   assertProtocolError(
-    () => parseModel('fast', { fast: 'mg:nope:SCNet-Max' }, known),
+    () => parseModel('fast', { fast: 'mg-nope:SCNet-Max' }, known),
     { status: 400, code: 'model_not_found' },
   )
 
   // 不传白名单 = 旧行为：格式合法就放行（纯函数可测性）
-  assert.deepEqual(parseModel('mg:nope:gpt-4o'), { provider: 'nope', actualModel: 'gpt-4o' })
-  assert.deepEqual(parseModel('mg:nope:gpt-4o', {}, undefined), { provider: 'nope', actualModel: 'gpt-4o' })
+  assert.deepEqual(parseModel('mg-nope:gpt-4o'), { provider: 'nope', actualModel: 'gpt-4o' })
+  assert.deepEqual(parseModel('mg-nope:gpt-4o', {}, undefined), { provider: 'nope', actualModel: 'gpt-4o' })
 })
 
 // -------------------------------------------------------- messages 各 role
 
 await test('messages: system/user 字符串 content', () => {
   const options = toGenerateOptions({
-    model: 'mg:auto',
+    model: 'mg-auto',
     messages: [
       { role: 'system', content: '你是助手' },
       { role: 'user', content: '你好' },
@@ -277,9 +282,9 @@ await test('messages: tool 配 tool_call_id；缺 id 报 400', () => {
 
 await test('messages: 空 messages / 非法 role / 非法 content 都 400', () => {
   const parsed = { provider: 'auto', actualModel: 'auto' }
-  assertProtocolError(() => toGenerateOptions({ model: 'mg:auto', messages: [] }, parsed),
+  assertProtocolError(() => toGenerateOptions({ model: 'mg-auto', messages: [] }, parsed),
     { status: 400, code: 'messages_required' })
-  assertProtocolError(() => toGenerateOptions({ model: 'mg:auto' }, parsed),
+  assertProtocolError(() => toGenerateOptions({ model: 'mg-auto' }, parsed),
     { status: 400, code: 'messages_required' })
   assertProtocolError(
     () => toGenerateOptions(baseBody({ messages: [{ role: 'function', content: 'x' }] }), parsed),
@@ -454,7 +459,7 @@ await test('mgw: stream/include_usage 记录，streamOptionsOf 剥掉私有字�
 
   assert.equal(options.mgw.stream, true)
   assert.equal(options.mgw.includeUsage, true)
-  assert.equal(options.mgw.requestedModel, 'mg:auto')
+  assert.equal(options.mgw.requestedModel, 'mg-auto')
 
   const clean = streamOptionsOf(options)
   assert.equal(clean.mgw, undefined)
@@ -541,8 +546,8 @@ await test('ProtocolError.toEnvelope 与 errorEnvelope 一致', () => {
 await test('modelsList: object:list + 每项 object:model/created/owned_by 齐全', () => {
   const list = modelsList(
     [
-      'mg:auto',
-      { id: 'mg:workbuddy:claude-sonnet-4', owned_by: 'workbuddy', created: 1700000000 },
+      'mg-auto',
+      { id: 'mg-workbuddy:claude-sonnet-4', owned_by: 'workbuddy', created: 1700000000 },
     ],
     { created: 1699999999 },
   )
@@ -555,7 +560,7 @@ await test('modelsList: object:list + 每项 object:model/created/owned_by 齐�
     assert.equal(typeof item.owned_by, 'string')
   }
   assert.deepEqual(list.data[0], {
-    id: 'mg:auto',
+    id: 'mg-auto',
     object: 'model',
     created: 1699999999,
     owned_by: 'model-gateway',
@@ -568,9 +573,9 @@ await test('modelsList: object:list + 每项 object:model/created/owned_by 齐�
 })
 
 await test('modelsList / modelObject: 空 id 跳过，非法入参抛 TypeError', () => {
-  assert.deepEqual(modelsList([{ id: '' }, 'mg:auto']).data.map((item) => item.id), ['mg:auto'])
+  assert.deepEqual(modelsList([{ id: '' }, 'mg-auto']).data.map((item) => item.id), ['mg-auto'])
   assert.throws(() => modelsList('nope'), TypeError)
-  assert.equal(modelObject({ id: 'mg:auto' }).id, 'mg:auto')
+  assert.equal(modelObject({ id: 'mg-auto' }).id, 'mg-auto')
   assert.throws(() => modelObject({}), TypeError)
 })
 
@@ -660,7 +665,7 @@ await test('server: healthz — ctx.llm 缺失 503，可用 200', async () => {
 await test('server: /v1/models 与 /models 双挂，字段合规', async () => {
   await withGateway({
     ctx: { llm: {} },
-    config: { models: ['mg:auto', { id: 'mg:workbuddy:claude-sonnet-4', owned_by: 'workbuddy' }] },
+    config: { models: ['mg-auto', { id: 'mg-workbuddy:claude-sonnet-4', owned_by: 'workbuddy' }] },
   }, async (_gateway, address) => {
     for (const path of ['/v1/models', '/models', '/v1/models/']) {
       const res = await call(`${address.url}${path}`)
@@ -676,14 +681,14 @@ await test('server: /v1/models 与 /models 双挂，字段合规', async () => {
 await test('server: GET /v1/models/:model — 命中 200，未命中 404', async () => {
   await withGateway({
     ctx: { llm: {} },
-    config: { models: ['mg:auto'] },
+    config: { models: ['mg-auto'] },
   }, async (_gateway, address) => {
-    const hit = await call(`${address.url}/v1/models/mg:auto`)
+    const hit = await call(`${address.url}/v1/models/mg-auto`)
     assert.equal(hit.status, 200)
-    assert.equal(hit.json.id, 'mg:auto')
+    assert.equal(hit.json.id, 'mg-auto')
     assert.equal(hit.json.object, 'model')
 
-    const encoded = await call(`${address.url}/v1/models/${encodeURIComponent('mg:auto')}`)
+    const encoded = await call(`${address.url}/v1/models/${encodeURIComponent('mg-auto')}`)
     assert.equal(encoded.status, 200)
 
     const miss = await call(`${address.url}/v1/models/nope`)
@@ -696,11 +701,11 @@ await test('server: GET /v1/models/:model — 命中 200，未命中 404', async
 await test('server: GET /v1/models/:model 支持带斜杠的模型 id，非法转义 400', async () => {
   await withGateway({
     ctx: { llm: {} },
-    config: { models: ['mg:scnet:org/model:v2'] },
+    config: { models: ['mg-scnet:org/model:v2'] },
   }, async (_gateway, address) => {
-    const hit = await call(`${address.url}/v1/models/mg:scnet:org/model:v2`)
+    const hit = await call(`${address.url}/v1/models/mg-scnet:org/model:v2`)
     assert.equal(hit.status, 200)
-    assert.equal(hit.json.id, 'mg:scnet:org/model:v2')
+    assert.equal(hit.json.id, 'mg-scnet:org/model:v2')
 
     const badEscape = await call(`${address.url}/v1/models/%E0%A4%A`)
     assert.equal(badEscape.status, 400)
@@ -708,10 +713,10 @@ await test('server: GET /v1/models/:model 支持带斜杠的模型 id，非法�
   })
 })
 
-await test('server: 默认 modelsProvider 只给 mg:auto', async () => {
+await test('server: 默认 modelsProvider 只给 mg-auto', async () => {
   await withGateway({ ctx: { llm: {} }, config: {} }, async (_gateway, address) => {
     const res = await call(`${address.url}/v1/models`)
-    assert.deepEqual(res.json.data.map((item) => item.id), ['mg:auto'])
+    assert.deepEqual(res.json.data.map((item) => item.id), ['mg-auto'])
   })
 })
 
@@ -725,7 +730,7 @@ await test('server: chat/completions 无 stream 能力 → 503 错误信封（TK
       assert.equal(res.status, 503, path)
       assert.equal(res.json.error.type, 'server_error')
       assert.equal(res.json.error.code, 'llm_unavailable')
-      assert.ok(!res.text.includes('mg:auto'), '错误体不该回显请求正文')
+      assert.ok(!res.text.includes('mg-auto'), '错误体不该回显请求正文')
     }
   })
 })
@@ -745,11 +750,11 @@ await test('server: chat/completions 模型非法 → 400 model_not_found', asyn
 await test('server: 未接入的 provider 400（从 modelsProvider 推导白名单）', async () => {
   await withGateway({
     ctx: { llm: {} },
-    config: { aliases: { fast: 'mg:scnet:SCNet-Max' } },
-    modelsProvider: () => ['mg:auto', { id: 'mg:workbuddy:claude-sonnet-4' }],
+    config: { aliases: { fast: 'mg-scnet:SCNet-Max' } },
+    modelsProvider: () => ['mg-auto', { id: 'mg-workbuddy:claude-sonnet-4' }],
   }, async (_gateway, address) => {
     // workbuddy 在目录里、scnet 在别名目标里，两个都算已接入
-    for (const model of ['mg:workbuddy:claude-sonnet-4', 'fast']) {
+    for (const model of ['mg-workbuddy:claude-sonnet-4', 'fast']) {
       const res = await call(`${address.url}/v1/chat/completions`, {
         method: 'POST',
         body: baseBody({ model }),
@@ -760,7 +765,7 @@ await test('server: 未接入的 provider 400（从 modelsProvider 推导白名�
 
     const unknown = await call(`${address.url}/v1/chat/completions`, {
       method: 'POST',
-      body: baseBody({ model: 'mg:nope:gpt-4o' }),
+      body: baseBody({ model: 'mg-nope:gpt-4o' }),
     })
     assert.equal(unknown.status, 400)
     assert.equal(unknown.json.error.param, 'model')
@@ -773,21 +778,21 @@ await test('server: 显式 providers 钩子优先（函数形式，运行期可�
   let allow = ['auto', 'workbuddy']
   await withGateway({
     ctx: { llm: {} },
-    config: { models: ['mg:auto'] },
+    config: { models: ['mg-auto'] },
     providers: () => allow,
   }, async (gateway, address) => {
     assert.deepEqual([...gateway.protocol.knownProviders()].sort(), ['auto', 'workbuddy'])
 
     const before = await call(`${address.url}/v1/chat/completions`, {
       method: 'POST',
-      body: baseBody({ model: 'mg:scnet:SCNet-Max' }),
+      body: baseBody({ model: 'mg-scnet:SCNet-Max' }),
     })
     assert.equal(before.status, 400)
 
     allow = ['auto', 'workbuddy', 'scnet']
     const after = await call(`${address.url}/v1/chat/completions`, {
       method: 'POST',
-      body: baseBody({ model: 'mg:scnet:SCNet-Max' }),
+      body: baseBody({ model: 'mg-scnet:SCNet-Max' }),
     })
     assert.equal(after.status, 503)
     assert.equal(after.headers['x-mgw-provider'], 'scnet')
@@ -796,7 +801,7 @@ await test('server: 显式 providers 钩子优先（函数形式，运行期可�
 
 await test('server: models 列表 created 是网关启动时间戳（非 0）', async () => {
   const before = Math.floor(Date.now() / 1000)
-  await withGateway({ ctx: { llm: {} }, config: { models: ['mg:auto'] } }, async (_gateway, address) => {
+  await withGateway({ ctx: { llm: {} }, config: { models: ['mg-auto'] } }, async (_gateway, address) => {
     const after = Math.floor(Date.now() / 1000)
     const res = await call(`${address.url}/v1/models`)
     const created = res.json.data[0].created
@@ -805,7 +810,7 @@ await test('server: models 列表 created 是网关启动时间戳（非 0）', 
     assert.ok(created !== 0)
 
     // 单个模型详情也要带同一个时间戳
-    const one = await call(`${address.url}/v1/models/mg:auto`)
+    const one = await call(`${address.url}/v1/models/mg-auto`)
     assert.equal(one.json.created, created)
   })
 })
@@ -837,7 +842,7 @@ await test('server: 非法 JSON / 空 messages 都是 400 信封', async () => {
 
     const emptyMessages = await call(`${address.url}/v1/chat/completions`, {
       method: 'POST',
-      body: { model: 'mg:auto', messages: [] },
+      body: { model: 'mg-auto', messages: [] },
     })
     assert.equal(emptyMessages.status, 400)
     assert.equal(emptyMessages.json.error.code, 'messages_required')
@@ -848,7 +853,7 @@ await test('server: chatHandler 注入点收到解析好的 GenerateOptions', as
   const seen = []
   await withGateway({
     ctx: { llm: {} },
-    config: { aliases: { fast: 'mg:scnet:SCNet-Max' } },
+    config: { aliases: { fast: 'mg-scnet:SCNet-Max' } },
     chatHandler: async (hook) => {
       seen.push(hook)
       hook.response.writeHead(200, { 'content-type': 'application/json' })
@@ -1032,7 +1037,7 @@ await test('TK-0002 非流式：chunk 聚合 + usage + finish_reason + reasoning
     assert.equal(res.status, 200)
     assert.equal(res.json.object, 'chat.completion')
     assert.match(res.json.id, /^chatcmpl-/)
-    assert.equal(res.json.model, 'mg:auto')
+    assert.equal(res.json.model, 'mg-auto')
     assert.equal(res.json.choices.length, 1)
     assert.equal(res.json.choices[0].index, 0)
     assert.equal(res.json.choices[0].message.role, 'assistant')
@@ -1400,7 +1405,7 @@ await test('TK-0003 appendAudit：只写白名单字段，多传的正文/Key/�
     at: '2026-01-02T03:04:05.000Z',
     keyId: created.id,
     keySuffix: created.key.slice(-4),
-    model: 'mg:auto',
+    model: 'mg-auto',
     account: 'workbuddy',
     promptTokens: 11,
     completionTokens: 7,
@@ -1420,7 +1425,7 @@ await test('TK-0003 appendAudit：只写白名单字段，多传的正文/Key/�
     'account', 'at', 'completionTokens', 'keyId', 'keySuffix', 'model', 'promptTokens', 'status',
   ])
   assert.equal(entry.keyId, created.id)
-  assert.equal(entry.model, 'mg:auto')
+  assert.equal(entry.model, 'mg-auto')
   assert.equal(entry.promptTokens, 11)
   assert.equal(entry.completionTokens, 7)
   assert.equal(entry.status, 200)
@@ -1602,7 +1607,7 @@ await test('TK-0003 审计：成功与失败各写一条，字段齐全且不含
   }, async (_gateway, address) => {
     const ok = await call(`${address.url}/v1/chat/completions`, {
       method: 'POST',
-      body: baseBody({ model: 'mg:auto', messages: [{ role: 'user', content: secretText }] }),
+      body: baseBody({ model: 'mg-auto', messages: [{ role: 'user', content: secretText }] }),
       headers: { authorization: `Bearer ${created.key}` },
     })
     assert.equal(ok.status, 200)
@@ -1630,7 +1635,7 @@ await test('TK-0003 审计：成功与失败各写一条，字段齐全且不含
   assert.ok(success !== undefined, `应有 200 的记录：${text}`)
   assert.equal(success.keyId, created.id)
   assert.equal(success.keySuffix, created.key.slice(-4))
-  assert.equal(success.model, 'mg:auto')
+  assert.equal(success.model, 'mg-auto')
   assert.equal(success.promptTokens, 8, 'prompt = input + cacheRead + cacheWrite')
   assert.equal(success.completionTokens, 3)
   assert.ok(typeof success.at === 'string' && success.at.includes('T'))

@@ -57,13 +57,13 @@
     "done": "Done",
     "hashOnly": "SHA-256 hash only",
     "aliases": "Model aliases",
-    "aliasesHint": "mg:provider:model works directly; aliases give agents a stable short name.",
+    "aliasesHint": "mg-provider:model works directly; aliases give agents a stable short name.",
     "alias": "Alias",
     "target": "Target",
     "addAlias": "+ Add alias",
     "addAliasTitle": "New alias",
     "aliasPlaceholder": "e.g. gpt-4o",
-    "targetPlaceholder": "mg:auto or mg:workbuddy:model",
+    "targetPlaceholder": "mg-auto or mg-workbuddy:model",
     "warning": "⚠ These six platforms are private APIs billed to your own accounts; for personal research only, no commercial use.",
     "errorPrefix": "Gateway error: "
   }
