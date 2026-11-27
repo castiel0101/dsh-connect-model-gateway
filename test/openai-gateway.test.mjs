@@ -22,6 +22,7 @@ import {
   finishReasonOf,
   modelObject,
   modelsList,
+  applyAliases,
   parseImageUrl,
   parseModel,
   sanitizeErrorMessage,
@@ -193,6 +194,46 @@ await test('parseModel knownProviders: 未知 provider 400、已知通过、不�
   // 不传白名单 = 旧行为：格式合法就放行（纯函数可测性）
   assert.deepEqual(parseModel('mg-nope:gpt-4o'), { provider: 'nope', actualModel: 'gpt-4o' })
   assert.deepEqual(parseModel('mg-nope:gpt-4o', {}, undefined), { provider: 'nope', actualModel: 'gpt-4o' })
+})
+
+await test('applyAliases: 有别名就只报别名，同一模型不重复出现', () => {
+  const entries = [
+    'mg-auto',
+    { id: 'mg-workbuddy:claude-sonnet-4', owned_by: 'workbuddy', context_length: 200000 },
+    { id: 'mg-scnet:SCNet-Max', owned_by: 'scnet' },
+  ]
+  const out = applyAliases(entries, {
+    'claude': 'mg-workbuddy:claude-sonnet-4',
+  })
+  // 原名必须消失，否则调用方会看到同一个模型两条
+  assert.deepEqual(out.map((e) => (typeof e === 'string' ? e : e.id)), [
+    'mg-auto', 'claude', 'mg-scnet:SCNet-Max',
+  ])
+  // 别名条目仍带能力字段（只是换了 id）
+  assert.equal(out[1].context_length, 200000)
+  assert.equal(out[1].owned_by, 'workbuddy')
+})
+
+await test('applyAliases: 一个模型只认第一个别名，多余的别名不额外产条目', () => {
+  const out = applyAliases(
+    [{ id: 'mg-scnet:SCNet-Max' }],
+    { first: 'mg-scnet:SCNet-Max', second: 'mg-scnet:SCNet-Max' },
+  )
+  // 仍是一条，用第一个别名
+  assert.equal(out.length, 1)
+  assert.equal(out[0].id, 'first')
+})
+
+await test('applyAliases: mg-auto 也能起别名', () => {
+  const out = applyAliases(['mg-auto'], { default: 'mg-auto' })
+  assert.deepEqual(out, ['default'])
+})
+
+await test('applyAliases: 无别名的目录原样返回', () => {
+  const entries = ['mg-auto', { id: 'mg-scnet:SCNet-Max' }]
+  const out = applyAliases(entries, {})
+  assert.deepEqual(out.map((e) => (typeof e === 'string' ? e : e.id)), ['mg-auto', 'mg-scnet:SCNet-Max'])
+  assert.deepEqual(applyAliases(entries, undefined).length, 2)
 })
 
 await test('modelsList: 上下文窗口与能力字段（有值才输出，不编造）', () => {
