@@ -682,16 +682,16 @@ await test('server: 默认 modelsProvider 只给 mg:auto', async () => {
   })
 })
 
-await test('server: chat/completions 默认 501 + 错误信封（TK-0002 占位）', async () => {
+await test('server: chat/completions 无 stream 能力 → 503 错误信封（TK-0002）', async () => {
   await withGateway({ ctx: { llm: {} }, config: {} }, async (_gateway, address) => {
     for (const path of ['/v1/chat/completions', '/chat/completions']) {
       const res = await call(`${address.url}${path}`, {
         method: 'POST',
         body: baseBody(),
       })
-      assert.equal(res.status, 501, path)
+      assert.equal(res.status, 503, path)
       assert.equal(res.json.error.type, 'server_error')
-      assert.equal(res.json.error.code, 'not_implemented')
+      assert.equal(res.json.error.code, 'llm_unavailable')
       assert.ok(!res.text.includes('mg:auto'), '错误体不该回显请求正文')
     }
   })
@@ -721,7 +721,7 @@ await test('server: 未接入的 provider 400（从 modelsProvider 推导白名�
         method: 'POST',
         body: baseBody({ model }),
       })
-      assert.equal(res.status, 501, `${model} 应通过 parseModel`)
+      assert.equal(res.status, 503, `${model} 应通过 parseModel`)
       assert.equal(res.headers['x-mgw-provider'], decodeURIComponent(model === 'fast' ? 'scnet' : 'workbuddy'))
     }
 
@@ -756,7 +756,7 @@ await test('server: 显式 providers 钩子优先（函数形式，运行期可�
       method: 'POST',
       body: baseBody({ model: 'mg:scnet:SCNet-Max' }),
     })
-    assert.equal(after.status, 501)
+    assert.equal(after.status, 503)
     assert.equal(after.headers['x-mgw-provider'], 'scnet')
   })
 })
@@ -923,6 +923,337 @@ await test('server: address/stop/start 幂等', async () => {
   await gateway.stop()
   assert.equal(gateway.address(), undefined)
   await gateway.stop() // 再停一次不炸
+})
+
+
+// ------------------------------------------------------ TK-0002 chat 流式/非流式
+
+/** 通用脚本流：按 chunk 序列回放；可 observe 每次 next/return。 */
+function scriptedStream(chunks, observe = {}) {
+  return function stream() {
+    let index = 0
+    let done = false
+    return {
+      [Symbol.asyncIterator]() { return this },
+      next() {
+        observe.next?.(index)
+        if (index >= chunks.length) {
+          done = true
+          return Promise.resolve({ value: undefined, done: true })
+        }
+        return Promise.resolve({ value: chunks[index++], done: false })
+      },
+      return() {
+        observe.return?.()
+        done = true
+        return Promise.resolve({ value: undefined, done: true })
+      },
+    }
+  }
+}
+
+/** 会抛错的流：第 n 次 next 抛异常。 */
+function throwingStream(chunks, throwAt, observe = {}) {
+  return function stream() {
+    let index = 0
+    return {
+      [Symbol.asyncIterator]() { return this },
+      next() {
+        if (index === throwAt) return Promise.reject(new Error('boom secret /Users/jack/key'))
+        if (index >= chunks.length) return Promise.resolve({ value: undefined, done: true })
+        return Promise.resolve({ value: chunks[index++], done: false })
+      },
+      return() { observe.return?.(); return Promise.resolve({ value: undefined, done: true }) },
+    }
+  }
+}
+
+const usageChunk = {
+  type: 'usage',
+  usage: { inputTokens: 7, cacheReadTokens: 2, cacheWriteTokens: 1, outputTokens: 4 },
+}
+
+await test('TK-0002 非流式：chunk 聚合 + usage + finish_reason + reasoning 独立字段', async () => {
+  const chunks = [
+    { type: 'text-delta', index: 0, text: '你' },
+    { type: 'text-delta', index: 0, text: '好' },
+    { type: 'reasoning-delta', index: 1, text: '先想一下' },
+    { type: 'reasoning-delta', index: 1, text: '再回答' },
+    usageChunk,
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  let seen
+  await withGateway({
+    ctx: { llm: { stream: scriptedStream(chunks, { next: (i) => { seen = i } }) } },
+    config: {},
+  }, async (_gateway, address) => {
+    const res = await call(`${address.url}/v1/chat/completions`, {
+      method: 'POST',
+      body: baseBody({ stream: false }),
+    })
+    assert.equal(res.status, 200)
+    assert.equal(res.json.object, 'chat.completion')
+    assert.match(res.json.id, /^chatcmpl-/)
+    assert.equal(res.json.model, 'mg:auto')
+    assert.equal(res.json.choices.length, 1)
+    assert.equal(res.json.choices[0].index, 0)
+    assert.equal(res.json.choices[0].message.role, 'assistant')
+    assert.equal(res.json.choices[0].message.content, '你好')
+    assert.equal(res.json.choices[0].message.reasoning_content, '先想一下再回答')
+    assert.equal(res.json.choices[0].message.tool_calls, undefined)
+    assert.equal(res.json.choices[0].finish_reason, 'stop')
+    assert.deepEqual(res.json.usage, { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 })
+  })
+  assert.equal(seen, chunks.length, '全部 chunk 被消费')
+})
+
+await test('TK-0002 非流式：工具调用 arguments 拼成合法 JSON，finish_reason=tool_calls', async () => {
+  const chunks = [
+    { type: 'text-delta', index: 0, text: '' },
+    { type: 'tool-call-delta', index: 1, id: 'call_1', name: 'get_weather', argumentsDelta: '{"city":' },
+    { type: 'tool-call-delta', index: 1, id: 'call_1', argumentsDelta: '"北京"}' },
+    { type: 'tool-call-delta', index: 2, id: 'call_2', name: 'get_time', argumentsDelta: '{}' },
+    { type: 'finish', reason: { kind: 'tool-calls' } },
+  ]
+  await withGateway({
+    ctx: { llm: { stream: scriptedStream(chunks) } },
+    config: {},
+  }, async (_gateway, address) => {
+    const res = await call(`${address.url}/chat/completions`, { method: 'POST', body: baseBody() })
+    assert.equal(res.status, 200)
+    const choice = res.json.choices[0]
+    assert.equal(choice.finish_reason, 'tool_calls')
+    assert.equal(choice.message.tool_calls.length, 2)
+    assert.deepEqual(choice.message.tool_calls.map((tool) => tool.index), [0, 1])
+    assert.equal(choice.message.tool_calls[0].id, 'call_1')
+    assert.equal(choice.message.tool_calls[0].type, 'function')
+    assert.equal(choice.message.tool_calls[0].function.name, 'get_weather')
+    assert.deepEqual(JSON.parse(choice.message.tool_calls[0].function.arguments), { city: '北京' })
+    assert.deepEqual(JSON.parse(choice.message.tool_calls[1].function.arguments), {})
+    assert.equal(choice.message.reasoning_content, undefined)
+  })
+})
+
+await test('TK-0002 非流式：max-tokens→length / aborted 不发结束 / error→502', async () => {
+  for (const [reason, expected] of [[{ kind: 'max-tokens' }, 'length'], [{ kind: 'aborted', failure: {} }, 'stop']]) {
+    await withGateway({
+      ctx: { llm: { stream: scriptedStream([
+        { type: 'text-delta', index: 0, text: 'abc' },
+        { type: 'tool-call-delta', index: 1, id: 'c', name: 'f', argumentsDelta: '{}' },
+        { type: 'finish', reason },
+      ]) } },
+      config: {},
+    }, async (_gateway, address) => {
+      const res = await call(`${address.url}/v1/chat/completions`, { method: 'POST', body: baseBody() })
+      assert.equal(res.status, 200)
+      assert.equal(res.json.choices[0].finish_reason, expected)
+      if (reason.kind === 'max-tokens') {
+        assert.equal(res.json.choices[0].message.tool_calls, undefined, 'max-tokens 丢掉不可靠工具调用')
+      } else {
+        assert.equal(res.json.choices[0].message.tool_calls.length, 1)
+      }
+    })
+  }
+  await withGateway({
+    ctx: { llm: { stream: scriptedStream([
+      { type: 'finish', reason: { kind: 'error', failure: { code: 'RATE_LIMIT', message: 'quota exceeded' } } },
+    ]) } },
+    config: {},
+  }, async (_gateway, address) => {
+    const res = await call(`${address.url}/v1/chat/completions`, { method: 'POST', body: baseBody() })
+    assert.equal(res.status, 502)
+    assert.equal(res.json.error.code, 'rate_limit')
+  })
+})
+
+/** 用 fetch 收完整 SSE 文本（含 [DONE] 行）。 */
+async function fetchSse(url, body, init = {}) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(init.headers ?? {}) },
+    body: JSON.stringify(body),
+    signal: init.signal,
+  })
+  const text = await res.text()
+  return { res, text }
+}
+
+/** SSE 文本 → 各帧 payload 与末行断言。 */
+function parseSse(text) {
+  const blocks = text.split('\n\n')
+  const last = blocks.pop()
+  assert.equal(text.endsWith('data: [DONE]\n\n'), true, '末行必须是严格 data: [DONE]')
+  assert.equal(last, '', '最后一帧后只剩空串')
+  return blocks.filter((block) => block !== 'data: [DONE]').map((block) => {
+    assert.ok(block.startsWith('data: '), `非法 SSE 帧：${block}`)
+    return JSON.parse(block.slice(6))
+  })
+}
+
+await test('TK-0002 流式：头四项 + role 首帧 + 逐帧映射 + 严格 [DONE] + include_usage', async () => {
+  const chunks = [
+    { type: 'reasoning-delta', index: 0, text: '思考' },
+    { type: 'reasoning-delta', index: 0, text: '中' },
+    { type: 'text-delta', index: 1, text: '你' },
+    { type: 'text-delta', index: 1, text: '好' },
+    { type: 'block-start', index: 2, blockType: 'tool-call' },
+    { type: 'tool-call-delta', index: 2, id: 'call_x', name: 'search', argumentsDelta: '{"q":' },
+    { type: 'tool-call-delta', index: 2, id: 'call_x', argumentsDelta: '"hi"}' },
+    usageChunk,
+    { type: 'finish', reason: { kind: 'tool-calls' } },
+  ]
+  await withGateway({
+    ctx: { llm: { stream: scriptedStream(chunks) } },
+    config: {},
+  }, async (_gateway, address) => {
+    const { res, text } = await fetchSse(`${address.url}/v1/chat/completions`, baseBody({
+      stream: true,
+      stream_options: { include_usage: true },
+    }))
+    assert.equal(res.status, 200)
+    assert.equal(res.headers.get('content-type'), 'text/event-stream; charset=utf-8')
+    assert.equal(res.headers.get('cache-control'), 'no-cache')
+    assert.equal(res.headers.get('connection'), 'keep-alive')
+    assert.equal(res.headers.get('x-accel-buffering'), 'no')
+
+    const frames = parseSse(text)
+    assert.deepEqual(frames[0].choices[0].delta, { role: 'assistant' })
+    assert.equal(frames[0].object, 'chat.completion.chunk')
+    assert.match(frames[0].id, /^chatcmpl-/)
+
+    const reasoning = frames.filter((f) => f.choices[0]?.delta?.reasoning_content).map((f) => f.choices[0].delta.reasoning_content).join('')
+    const content = frames.filter((f) => f.choices[0]?.delta?.content).map((f) => f.choices[0].delta.content).join('')
+    assert.equal(reasoning, '思考中')
+    assert.equal(content, '你好')
+
+    const toolFrames = frames.filter((f) => f.choices[0]?.delta?.tool_calls)
+    assert.deepEqual(toolFrames.map((f) => f.choices[0].delta.tool_calls[0].index), [0, 0])
+    assert.equal(toolFrames[0].choices[0].delta.tool_calls[0].id, 'call_x')
+    assert.equal(toolFrames[0].choices[0].delta.tool_calls[0].function.name, 'search')
+    const args = toolFrames.map((f) => f.choices[0].delta.tool_calls[0].function.arguments).join('')
+    assert.deepEqual(JSON.parse(args), { q: 'hi' })
+
+    const finishFrame = frames.find((f) => f.choices[0]?.finish_reason)
+    assert.equal(finishFrame.choices[0].finish_reason, 'tool_calls')
+    assert.deepEqual(finishFrame.choices[0].delta, {})
+
+    const usageFrame = frames.at(-1)
+    assert.deepEqual(usageFrame.choices, [])
+    assert.deepEqual(usageFrame.usage, { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 })
+  })
+})
+
+await test('TK-0002 流式：不请求 usage 时无 usage 帧；aborted 不发 finish_reason', async () => {
+  for (const reason of [{ kind: 'stop' }, { kind: 'aborted', failure: {} }]) {
+    await withGateway({
+      ctx: { llm: { stream: scriptedStream([
+        { type: 'text-delta', index: 0, text: 'hi' },
+        { type: 'usage', usage: { inputTokens: 1, outputTokens: 1 } },
+        { type: 'finish', reason },
+      ]) } },
+      config: {},
+    }, async (_gateway, address) => {
+      const { text } = await fetchSse(`${address.url}/v1/chat/completions`, baseBody({ stream: true }))
+      const frames = parseSse(text)
+      assert.equal(frames.at(-1).usage, undefined, '未请求 include_usage 不应发 usage 帧')
+      const finishes = frames.filter((f) => f.choices[0]?.finish_reason)
+      if (reason.kind === 'aborted') {
+        assert.equal(finishes.length, 0)
+      } else {
+        assert.equal(finishes.at(-1).choices[0].finish_reason, 'stop')
+      }
+    })
+  }
+})
+
+await test('TK-0002 流式：流中途抛错 → iterator.return() + error chunk + [DONE] + 不改 200', async () => {
+  const returned = []
+  await withGateway({
+    ctx: { llm: { stream: throwingStream([
+      { type: 'text-delta', index: 0, text: 'partial' },
+      { type: 'text-delta', index: 0, text: ' partial2' },
+    ], 2, { return: () => returned.push(1) }) } },
+    config: {},
+    warn: () => {},
+  }, async (_gateway, address) => {
+    const { res, text } = await fetchSse(`${address.url}/v1/chat/completions`, baseBody({ stream: true }))
+    assert.equal(res.status, 200, '已发 200 后不能改状态码')
+    const frames = parseSse(text)
+    const errorFrame = frames.at(-1)
+    assert.equal(errorFrame.error.code, 'internal_error')
+    assert.ok(!JSON.stringify(errorFrame).includes('secret'), '错误帧必须脱敏')
+    assert.equal(returned.length, 1, 'iterator.return() 必须被调用')
+  })
+})
+
+await test('TK-0002 非流式：流抛错 → iterator.return() + 标准错误信封（不回显 stack）', async () => {
+  const returned = []
+  await withGateway({
+    ctx: { llm: { stream: throwingStream([], 0, { return: () => returned.push(1) }) } },
+    config: {},
+  }, async (_gateway, address) => {
+    const res = await call(`${address.url}/v1/chat/completions`, { method: 'POST', body: baseBody() })
+    assert.equal(res.status, 500)
+    assert.equal(res.json.error.code, 'internal_error')
+    assert.ok(!res.text.includes('secret'))
+    assert.equal(returned.length, 1)
+  })
+})
+
+await test('TK-0002 流式：客户端断连 → iterator.return() 被调用', async () => {
+  const returned = []
+  let released
+  await withGateway({
+    ctx: { llm: { stream() {
+      return (async function* () {
+        try {
+          yield { type: 'text-delta', index: 0, text: 'x' }
+          await new Promise((resolve) => { released = resolve; setTimeout(resolve, 5000) })
+          yield { type: 'text-delta', index: 0, text: 'y' }
+        } finally {
+          returned.push(1)
+        }
+      })()
+    } } },
+    config: {},
+  }, async (_gateway, address) => {
+    const controller = new AbortController()
+    const response = await fetch(`${address.url}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(baseBody({ stream: true })),
+      signal: controller.signal,
+    })
+    assert.equal(response.status, 200)
+    const reader = response.body.getReader()
+    await reader.read()
+    controller.abort()
+    reader.cancel().catch(() => {})
+    // 放开 iterator 里挂着的等待，让它走到 finally
+    released?.()
+    for (let i = 0; i < 50 && returned.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.equal(returned.length, 1, '断连后 iterator.return() 应释放生成器')
+  })
+})
+
+await test('TK-0002 背压：大块输出逐帧可读且顺序不乱（高水位后等 drain）', async () => {
+  const parts = Array.from({ length: 300 }, (_, i) => `seg-${i}-`.repeat(20))
+  await withGateway({
+    ctx: { llm: { stream: scriptedStream([
+      ...parts.map((text, i) => ({ type: 'text-delta', index: i, text })),
+      { type: 'finish', reason: { kind: 'stop' } },
+    ]) } },
+    config: {},
+  }, async (_gateway, address) => {
+    const { res, text } = await fetchSse(`${address.url}/v1/chat/completions`, baseBody({ stream: true }))
+    assert.equal(res.status, 200)
+    const frames = parseSse(text)
+    const content = frames.filter((f) => f.choices[0]?.delta?.content).map((f) => f.choices[0].delta.content).join('')
+    assert.equal(content, parts.join(''))
+    assert.equal(text.endsWith('data: [DONE]\n\n'), true)
+  })
 })
 
 // ------------------------------------------------------------------ 汇总
