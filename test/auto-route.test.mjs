@@ -21,6 +21,7 @@ import {
   createAutoRouter,
   createAutoStore,
   createCooling,
+  shouldSwitch,
 } from '../lib/core/auto-route.js'
 
 const dir = await mkdtemp(join(tmpdir(), 'mgw-auto-'))
@@ -418,6 +419,105 @@ function makeAdapter(ctx) {
   assert.equal(calls[0].provider, 'deepseek-account')
   assert.equal(calls[0].model, 'native-1')
   assert.equal(calls[0].scope?.accountId, '', '外部候选的 accountId 必须是空串，不能误用魔桥账号')
+}
+
+// ---------- 16. IMAGE_OFFLOAD_REQUIRED：原样透传、不切换、不冷却 ----------
+{
+  const iso = createAutoStore({ path: join(dir, 'auto-image.json') })
+  await iso.load()
+  await iso.addCandidates([
+    { provider: 'alpha', accountId: 'a1', model: 'm-1' },
+    { provider: 'alpha', accountId: 'a1', model: 'm-3' },
+  ])
+  const isoCooling = createCooling()
+  const isoRouter = createAutoRouter({ store: iso, manager, canImageNow: () => true })
+  const { ctx, calls } = fakeHost({
+    'alpha|m-1': async function* () {
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            code: 'IMAGE_OFFLOAD_REQUIRED',
+            message: 'pi-ai request images exceed the route image budget; 8 more oldest occurrence(s) must be offloaded.',
+            offloadImages: 8,
+            status: 400,
+          },
+        },
+      }
+    },
+    'alpha|m-3': async function* () { yield text('不该走到这里'); yield stop },
+  })
+  const adapter = createAutoAdapter({ ctx, store: iso, router: isoRouter, cooling: isoCooling, warn: () => {} })
+  const chunks = await collect(adapter.stream({ provider: 'auto', model: AUTO_MODEL, messages: [] }))
+  const last = chunks.at(-1)
+  assert.equal(last.reason.kind, 'error')
+  assert.equal(last.reason.failure.code, 'IMAGE_OFFLOAD_REQUIRED')
+  assert.equal(last.reason.failure.offloadImages, 8, 'offloadImages 必须原样透传，否则卸载插件无法接手')
+  assert.equal(last.reason.failure.status, 400, '其余失败字段也要保留')
+  assert.equal(calls.length, 1, '这类请求侧错误不换候选')
+  assert.equal(
+    isoCooling.active(candidateKey({ provider: 'alpha', accountId: 'a1', model: 'm-1' })),
+    false,
+    '不该给候选上冷却',
+  )
+
+  // 抛错路径同样要保留字段（宿主 LlmError 是 throw 出来的）
+  const thrown = createAutoStore({ path: join(dir, 'auto-image-throw.json') })
+  await thrown.load()
+  await thrown.addCandidates([{ provider: 'alpha', accountId: 'a1', model: 'm-1' }])
+  const thrownCooling = createCooling()
+  const thrownRouter = createAutoRouter({ store: thrown, manager, canImageNow: () => true })
+  const { ctx: thrownCtx } = fakeHost({
+    'alpha|m-1': async function* () {
+      throw Object.assign(new Error('budget'), {
+        failure: { code: 'IMAGE_OFFLOAD_REQUIRED', message: 'budget', offloadImages: 4 },
+      })
+    },
+  })
+  const thrownAdapter = createAutoAdapter({ ctx: thrownCtx, store: thrown, router: thrownRouter, cooling: thrownCooling, warn: () => {} })
+  const thrownChunks = await collect(thrownAdapter.stream({ provider: 'auto', model: AUTO_MODEL, messages: [] }))
+  assert.equal(thrownChunks.at(-1).reason.failure.offloadImages, 4, '抛错路径也要带 offloadImages')
+
+  // 策略层面：即使有人把它手工勾进 switchOn，也永远不切
+  assert.equal(shouldSwitch({ code: 'IMAGE_OFFLOAD_REQUIRED' }, { switchOn: ['IMAGE_OFFLOAD_REQUIRED'] }), false)
+  assert.equal(shouldSwitch({ code: 'IMAGE_OFFLOAD_REQUIRED' }, undefined), false)
+  assert.equal(shouldSwitch({ code: 'RATE_LIMIT' }, undefined), true, '普通可切换码不受影响')
+}
+
+// ---------- 17. 图片预算：默认值、配置覆盖、非法回退 ----------
+{
+  // 顶层导出只暴露 apply/name/inject 时，跳过下面针对 resolveImageBudgets 的断言
+  const { resolveImageBudgets } = await import('../lib/index.js')
+  assert.equal(typeof resolveImageBudgets, 'function', '图片预算归一化函数必须可测')
+
+  const defaults = resolveImageBudgets()
+  assert.deepEqual(defaults, {
+    maxRequestImageBytes: 20_971_520,
+    requestImagePixelBudget: 4_194_304,
+    requestImageMaxBytes: 1_048_576,
+    maxRequestImages: 20,
+    imageOffloadCountQuantum: 5,
+  }, '默认预算必须是 20/5，字节上限不变')
+
+  const overridden = resolveImageBudgets({ imageBudgets: {
+    maxRequestImages: 32,
+    imageOffloadCountQuantum: 8,
+    maxRequestImageBytes: 8_388_608,
+  } })
+  assert.equal(overridden.maxRequestImages, 32, 'maxRequestImages 可被 config.imageBudgets 覆盖')
+  assert.equal(overridden.imageOffloadCountQuantum, 8, '量子可被 config.imageBudgets 覆盖')
+  assert.equal(overridden.maxRequestImageBytes, 8_388_608, '字节上限可被 config.imageBudgets 覆盖')
+  assert.equal(overridden.requestImagePixelBudget, 4_194_304, '未覆盖字段保持默认')
+
+  const invalid = resolveImageBudgets({ imageBudgets: { maxRequestImages: 2, imageOffloadCountQuantum: 10 } })
+  assert.equal(invalid.maxRequestImages, 20, '量子 > maxImages 时 maxImages 回退默认')
+  assert.equal(invalid.imageOffloadCountQuantum, 5, '量子 > maxImages 时量子回退默认')
+  assert.ok(invalid.imageOffloadCountQuantum <= invalid.maxRequestImages, '回退后必须满足 quantum <= maxImages')
+
+  const badType = resolveImageBudgets({ imageBudgets: { maxRequestImages: -1, imageOffloadCountQuantum: '8' } })
+  assert.equal(badType.maxRequestImages, 20, '非法类型/数值回退默认')
+  assert.equal(badType.imageOffloadCountQuantum, 5)
 }
 
 console.log('auto-route: 全部断言通过')
