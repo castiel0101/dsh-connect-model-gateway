@@ -10,6 +10,9 @@
 
 import assert from 'node:assert/strict'
 import { request as httpRequest } from 'node:http'
+import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import {
   ProtocolError,
@@ -26,6 +29,31 @@ import {
   toGenerateOptions,
 } from '../lib/core/openai-protocol.js'
 import { createGateway } from '../lib/core/openai-gateway.js'
+import { createKeyStore } from '../lib/core/gateway-keys.js'
+
+// ------------------------------------------------------- TK-0003 测试夹具
+//
+// TK-0003 起网关默认要鉴权，旧测试（TK-0001/0002 时期鉴权是透传、不带 Key）
+// 统一走下面这套夹具：临时目录 + 真实 Key 存储 + 一把合法 Key。
+// **没有**把鉴权改回透传。
+
+/** 所有共享夹具落在同一个临时目录，跑完不清理（/tmp 下的 mkdtemp 目录）。 */
+const TEST_STATE_DIR = await mkdtemp(join(tmpdir(), 'mgw-test-'))
+
+/** 默认 Key 存储（真实实现，落 TEST_STATE_DIR）。 */
+const testKeys = createKeyStore({
+  keysPath: join(TEST_STATE_DIR, 'gateway.json'),
+  auditPath: join(TEST_STATE_DIR, 'gateway-audit.ndjson'),
+})
+
+/** setup 里 createKey 一次，全体旧测试复用。 */
+const TEST_KEY = (await testKeys.createKey('测试用 Key')).key
+
+/** 旧测试请求默认带的鉴权头。 */
+function authHeaders(extra = {}) {
+  return { authorization: `Bearer ${TEST_KEY}`, ...extra }
+}
+
 
 let passed = 0
 const failures = []
@@ -561,8 +589,8 @@ await test('finishReasonOf: 五种 DSH kind + 未知兜底', () => {
 
 // ------------------------------------------------------------ server 骨架
 
-/** 发一次 HTTP 请求，回 { status, headers, json, text }。 */
-function call(url, { method = 'GET', body, headers = {} } = {}) {
+/** 发一次 HTTP 请求，回 { status, headers, json, text }。默认带合法 Key（TK-0003 起必须鉴权）。 */
+function call(url, { method = 'GET', body, headers = {}, noAuth = false } = {}) {
   return new Promise((resolve, reject) => {
     const target = new URL(url)
     const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body))
@@ -575,6 +603,7 @@ function call(url, { method = 'GET', body, headers = {} } = {}) {
         ...(payload === undefined
           ? {}
           : { 'content-type': 'application/json', 'content-length': payload.length }),
+        ...(noAuth ? {} : authHeaders()),
         ...headers,
       },
     }, (response) => {
@@ -597,9 +626,13 @@ function call(url, { method = 'GET', body, headers = {} } = {}) {
   })
 }
 
-/** 起一个网关，用完关掉。 */
+/** 起一个网关，用完关掉。缺省把 Key/审计落到临时目录，绝不碰 ~/.dsh。 */
 async function withGateway(options, fn) {
-  const gateway = createGateway(options)
+  const gateway = createGateway({
+    keysPath: join(TEST_STATE_DIR, 'gateway.json'),
+    auditPath: join(TEST_STATE_DIR, 'gateway-audit.ndjson'),
+    ...options,
+  })
   const address = await gateway.start()
   try {
     await fn(gateway, address)
@@ -786,7 +819,7 @@ await test('server: 非法 JSON / 空 messages 都是 400 信封', async () => {
         port: target.port,
         path: target.pathname,
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', ...authHeaders() },
       }, (response) => {
         const chunks = []
         response.on('data', (chunk) => chunks.push(chunk))
@@ -913,7 +946,12 @@ await test('server: 未知路径 404 / 方法不对 405 / Host 头非回环 403'
 })
 
 await test('server: address/stop/start 幂等', async () => {
-  const gateway = createGateway({ ctx: { llm: {} }, config: {} })
+  const gateway = createGateway({
+    ctx: { llm: {} },
+    config: {},
+    keysPath: join(TEST_STATE_DIR, 'gateway.json'),
+    auditPath: join(TEST_STATE_DIR, 'gateway-audit.ndjson'),
+  })
   assert.equal(gateway.address(), undefined)
   const first = await gateway.start()
   const second = await gateway.start()
@@ -1070,7 +1108,7 @@ await test('TK-0002 非流式：max-tokens→length / aborted 不发结束 / err
 async function fetchSse(url, body, init = {}) {
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', ...(init.headers ?? {}) },
+    headers: { 'content-type': 'application/json', ...authHeaders(), ...(init.headers ?? {}) },
     body: JSON.stringify(body),
     signal: init.signal,
   })
@@ -1220,7 +1258,7 @@ await test('TK-0002 流式：客户端断连 → iterator.return() 被调用', a
     const controller = new AbortController()
     const response = await fetch(`${address.url}/v1/chat/completions`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...authHeaders() },
       body: JSON.stringify(baseBody({ stream: true })),
       signal: controller.signal,
     })
@@ -1253,6 +1291,439 @@ await test('TK-0002 背压：大块输出逐帧可读且顺序不乱（高水位
     const content = frames.filter((f) => f.choices[0]?.delta?.content).map((f) => f.choices[0].delta.content).join('')
     assert.equal(content, parts.join(''))
     assert.equal(text.endsWith('data: [DONE]\n\n'), true)
+  })
+})
+
+
+// ------------------------------------------- TK-0003 鉴权 / 多 Key / 限流 / 审计
+
+/** 每条 TK-0003 用例用独立临时目录，互不干扰。 */
+async function freshDir() {
+  return mkdtemp(join(tmpdir(), 'mgw-tk3-'))
+}
+
+/** 临时目录里的一对路径。 */
+function pathsOf(dir) {
+  return { keysPath: join(dir, 'gateway.json'), auditPath: join(dir, 'gateway-audit.ndjson') }
+}
+
+await test('TK-0003 Key 存储：明文只返回一次，落盘只有 hash/prefix/suffix', async () => {
+  const dir = await freshDir()
+  const { keysPath, auditPath } = pathsOf(dir)
+  const store = createKeyStore({ keysPath, auditPath })
+
+  const created = await store.createKey('我的 Key')
+  assert.match(created.key, /^mgw_live_[A-Za-z0-9_-]{32}$/)
+  assert.equal(typeof created.id, 'string')
+  assert.equal(created.name, '我的 Key')
+
+  const text = await readFile(keysPath, 'utf8')
+  assert.ok(!text.includes(created.key), 'gateway.json 绝不能出现明文')
+  assert.ok(!text.includes('mgw_live_'), 'gateway.json 连前缀都不该有多余出现')
+  assert.ok(text.includes(created.key.slice(-4)), 'suffix 应落盘用于界面识别')
+
+  const raw = JSON.parse(text)
+  assert.equal(raw.keys.length, 1)
+  const [record] = raw.keys
+  assert.equal(record.hash.length, 64, 'hash 是 sha256 hex')
+  assert.equal(record.prefix, created.key.slice('mgw_live_'.length, 'mgw_live_'.length + 4))
+  assert.equal(record.suffix, created.key.slice(-4))
+  assert.equal(record.enabled, true)
+  assert.equal(record.hash.includes(created.key), false)
+
+  // 权限 0600
+  const mode = (await stat(keysPath)).mode & 0o777
+  assert.equal(mode, 0o600, `gateway.json 权限应为 0600，实际 ${mode.toString(8)}`)
+  const dirMode = (await stat(dir)).mode & 0o777
+  assert.equal(dirMode, 0o700, `状态目录权限应为 0700，实际 ${dirMode.toString(8)}`)
+})
+
+await test('TK-0003 verifyKey：命中返回记录（不含 hash），错 Key/禁用 Key 返回 undefined', async () => {
+  const dir = await freshDir()
+  const store = createKeyStore(pathsOf(dir))
+  const created = await store.createKey('k1')
+
+  const hit = await store.verifyKey(created.key)
+  assert.equal(hit.id, created.id)
+  assert.equal(hit.hash, undefined, '对外记录不能带 hash')
+  assert.equal(hit.key, undefined, '对外记录不能带明文')
+  assert.ok(typeof hit.lastUsedAt === 'string', 'lastUsedAt 应被更新')
+
+  assert.equal(await store.verifyKey('mgw_live_00000000000000000000000000000000'), undefined)
+  // 长度不等也必须走完比较、不抛错（timingSafeEqual 原生长度不等会抛）
+  assert.equal(await store.verifyKey('x'), undefined)
+  assert.equal(await store.verifyKey(''), undefined)
+  assert.equal(await store.verifyKey(undefined), undefined)
+  assert.equal(await store.verifyKey(12345), undefined)
+
+  await store.setEnabled(created.id, false)
+  assert.equal(await store.verifyKey(created.key), undefined, '禁用后必须验不过')
+
+  const listed = await store.listKeys()
+  assert.equal(listed.length, 1)
+  assert.equal(listed[0].enabled, false)
+  assert.equal(listed[0].hash, undefined)
+  assert.equal(listed[0].lastUsedAt !== undefined, true)
+
+  assert.equal(await store.removeKey(created.id), true)
+  assert.deepEqual(await store.listKeys(), [])
+  assert.equal(await store.verifyKey(created.key), undefined)
+})
+
+await test('TK-0003 存储容错：文件不存在返回空结构；JSON 损坏 warn 后重建', async () => {
+  const dir = await freshDir()
+  const { keysPath } = pathsOf(dir)
+  const store = createKeyStore({ keysPath, auditPath: join(dir, 'a.ndjson') })
+
+  assert.deepEqual(await store.listKeys(), [], '文件不存在应返回空列表')
+
+  await writeFile(keysPath, '{ 这不是 JSON', 'utf8')
+  const warns = []
+  const broken = createKeyStore({ keysPath, auditPath: join(dir, 'a.ndjson'), warn: (m) => warns.push(m) })
+  assert.deepEqual(await broken.listKeys(), [], '损坏时按空存储处理，不能抛')
+  assert.ok(warns.some((m) => m.includes('损坏')), `应 warn 损坏，实际：${warns.join('|')}`)
+
+  // 重建：新建的 Key 能正常落盘并校验
+  const created = await broken.createKey('重建后的 Key')
+  assert.equal((await broken.verifyKey(created.key)).id, created.id)
+  const raw = JSON.parse(await readFile(keysPath, 'utf8'))
+  assert.equal(raw.keys.length, 1, '重建后文件应只含新 Key')
+})
+
+await test('TK-0003 appendAudit：只写白名单字段，多传的正文/Key/请求体全部丢弃', async () => {
+  const dir = await freshDir()
+  const { auditPath } = pathsOf(dir)
+  const store = createKeyStore(pathsOf(dir))
+  const created = await store.createKey('audit-key')
+
+  await store.appendAudit({
+    at: '2026-01-02T03:04:05.000Z',
+    keyId: created.id,
+    keySuffix: created.key.slice(-4),
+    model: 'mg:auto',
+    account: 'workbuddy',
+    promptTokens: 11,
+    completionTokens: 7,
+    status: 200,
+    // 下面这些绝不能被写进去
+    messages: [{ role: 'user', content: '机密正文-不许落盘' }],
+    key: created.key,
+    body: { messages: [{ role: 'user', content: '机密正文-不许落盘' }] },
+    stack: 'at foo (/secret/path.js:1)',
+  })
+
+  const text = await readFile(auditPath, 'utf8')
+  const lines = text.trim().split('\n')
+  assert.equal(lines.length, 1)
+  const entry = JSON.parse(lines[0])
+  assert.deepEqual(Object.keys(entry).sort(), [
+    'account', 'at', 'completionTokens', 'keyId', 'keySuffix', 'model', 'promptTokens', 'status',
+  ])
+  assert.equal(entry.keyId, created.id)
+  assert.equal(entry.model, 'mg:auto')
+  assert.equal(entry.promptTokens, 11)
+  assert.equal(entry.completionTokens, 7)
+  assert.equal(entry.status, 200)
+  assert.ok(!text.includes('机密正文'), '审计不能含 messages 正文')
+  assert.ok(!text.includes(created.key), '审计不能含完整 Key')
+  assert.ok(!text.includes('secret/path'), '审计不能含堆栈')
+
+  const mode = (await stat(auditPath)).mode & 0o777
+  assert.equal(mode, 0o600, `审计文件权限应为 0600，实际 ${mode.toString(8)}`)
+})
+
+/** 记录 ctx.llm.stream 调用次数，供「401 不进 chat」断言。 */
+function countingStream(chunks) {
+  const counter = { calls: 0 }
+  counter.stream = function stream() {
+    counter.calls += 1
+    return scriptedStream(chunks)()
+  }
+  return counter
+}
+
+await test('TK-0003 鉴权：无 Key / 错 Key / 已禁用 Key → 401 且不进入 chat 处理', async () => {
+  const dir = await freshDir()
+  const store = createKeyStore(pathsOf(dir))
+  const good = await store.createKey('good')
+  const disabled = await store.createKey('disabled')
+  await store.setEnabled(disabled.id, false)
+
+  const counter = countingStream([{ type: 'finish', reason: { kind: 'stop' } }])
+  await withGateway({
+    ctx: { llm: counter },
+    config: {},
+    keyStore: store,
+  }, async (_gateway, address) => {
+    const cases = [
+      { name: '无 Authorization', options: { noAuth: true } },
+      { name: '错 Key', options: { headers: { authorization: 'Bearer mgw_live_wrongwrongwrongwrongwrongwrong' } } },
+      { name: '非 Bearer 格式', options: { headers: { authorization: 'Basic abc' } } },
+      { name: '空 Bearer', options: { headers: { authorization: 'Bearer ' } } },
+      { name: '已禁用 Key', options: { headers: { authorization: `Bearer ${disabled.key}` } } },
+    ]
+    for (const item of cases) {
+      const res = await call(`${address.url}/v1/chat/completions`, {
+        method: 'POST',
+        body: baseBody(),
+        ...item.options,
+      })
+      assert.equal(res.status, 401, `${item.name} 应 401`)
+      assert.equal(res.json.error.type, 'authentication_error')
+      assert.equal(res.json.error.code, 'invalid_api_key')
+      assert.ok(!res.text.includes(good.key), '错误体绝不能回显完整 Key')
+      assert.ok(!res.text.includes('mgw_live_'), '错误体连 Key 片段都不该有')
+      assert.ok(!res.text.includes('at '), '错误体不能有堆栈')
+    }
+    assert.equal(counter.calls, 0, '鉴权失败绝不能调 ctx.llm.stream')
+
+    // /v1/models 也必须鉴权（OpenAI 标准）
+    const models = await call(`${address.url}/v1/models`, { noAuth: true })
+    assert.equal(models.status, 401)
+    const modelsOk = await call(`${address.url}/v1/models`, { headers: { authorization: `Bearer ${good.key}` } })
+    assert.equal(modelsOk.status, 200)
+
+    // healthz 仍在鉴权之前
+    const health = await call(`${address.url}/healthz`, { noAuth: true })
+    assert.equal(health.status, 200)
+
+    // 合法 Key 能进 chat
+    const ok = await call(`${address.url}/v1/chat/completions`, {
+      method: 'POST',
+      body: baseBody(),
+      headers: { authorization: `Bearer ${good.key}` },
+    })
+    assert.equal(ok.status, 200)
+    assert.equal(counter.calls, 1)
+  })
+})
+
+await test('TK-0003 限流：并发超限 429 + Retry-After，请求结束后闸门释放可恢复', async () => {
+  const dir = await freshDir()
+  const store = createKeyStore(pathsOf(dir))
+  const created = await store.createKey('rl')
+
+  let entered
+  const enteredPromise = new Promise((resolve) => { entered = resolve })
+  let release
+  const hold = new Promise((resolve) => { release = resolve })
+
+  await withGateway({
+    ctx: { llm: { stream() {
+      return (async function* () {
+        entered()
+        await hold
+        yield { type: 'text-delta', index: 0, text: 'ok' }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      })()
+    } } },
+    config: {},
+    keyStore: store,
+    limits: { concurrency: 1, perMinute: 100 },
+  }, async (_gateway, address) => {
+    const headers = { authorization: `Bearer ${created.key}` }
+    const first = fetch(`${address.url}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...headers },
+      body: JSON.stringify(baseBody({ stream: false })),
+    })
+    await enteredPromise
+
+    const blocked = await call(`${address.url}/v1/chat/completions`, {
+      method: 'POST',
+      body: baseBody(),
+      headers,
+    })
+    assert.equal(blocked.status, 429, '并发超限应 429')
+    assert.equal(blocked.json.error.type, 'rate_limit_error')
+    assert.equal(blocked.json.error.code, 'rate_limited')
+    assert.ok(Number(blocked.headers['retry-after']) >= 1, `应带 Retry-After，实际 ${blocked.headers['retry-after']}`)
+
+    release()
+    const firstRes = await first
+    assert.equal(firstRes.status, 200)
+    await firstRes.text()
+
+    // 闸门已释放：再来一次应恢复 200
+    for (let i = 0; i < 20; i += 1) {
+      const again = await call(`${address.url}/v1/chat/completions`, {
+        method: 'POST',
+        body: baseBody(),
+        headers,
+      })
+      if (again.status === 200) return
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    assert.fail('并发闸没有释放，后续请求一直是 429')
+  })
+})
+
+await test('TK-0003 限流：每分钟请求数超限 429（含 Retry-After 秒数）', async () => {
+  const dir = await freshDir()
+  const store = createKeyStore(pathsOf(dir))
+  const created = await store.createKey('per-minute')
+  await withGateway({
+    ctx: { llm: { stream: scriptedStream([
+      { type: 'text-delta', index: 0, text: 'hi' },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ]) } },
+    config: {},
+    keyStore: store,
+    limits: { concurrency: 8, perMinute: 2 },
+  }, async (_gateway, address) => {
+    const headers = { authorization: `Bearer ${created.key}` }
+    for (let i = 0; i < 2; i += 1) {
+      const ok = await call(`${address.url}/v1/chat/completions`, { method: 'POST', body: baseBody(), headers })
+      assert.equal(ok.status, 200, `第 ${i + 1} 次应放行`)
+    }
+    const blocked = await call(`${address.url}/v1/chat/completions`, { method: 'POST', body: baseBody(), headers })
+    assert.equal(blocked.status, 429)
+    assert.equal(blocked.json.error.code, 'rate_limited')
+    assert.ok(Number(blocked.headers['retry-after']) >= 1)
+    assert.ok(Number(blocked.headers['retry-after']) <= 60)
+  })
+})
+
+await test('TK-0003 审计：成功与失败各写一条，字段齐全且不含正文/完整 Key', async () => {
+  const dir = await freshDir()
+  const { keysPath, auditPath } = pathsOf(dir)
+  const store = createKeyStore({ keysPath, auditPath })
+  const created = await store.createKey('审计 Key')
+  const secretText = '审计绝不落盘的正文-abc123'
+
+  await withGateway({
+    ctx: { llm: { stream: scriptedStream([
+      { type: 'text-delta', index: 0, text: '你好' },
+      { type: 'usage', usage: { inputTokens: 5, cacheReadTokens: 2, cacheWriteTokens: 1, outputTokens: 3 } },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ]) } },
+    config: {},
+    keyStore: store,
+  }, async (_gateway, address) => {
+    const ok = await call(`${address.url}/v1/chat/completions`, {
+      method: 'POST',
+      body: baseBody({ model: 'mg:auto', messages: [{ role: 'user', content: secretText }] }),
+      headers: { authorization: `Bearer ${created.key}` },
+    })
+    assert.equal(ok.status, 200)
+  })
+
+  await withGateway({
+    ctx: { llm: {} },
+    config: {},
+    keyStore: store,
+  }, async (_gateway, address) => {
+    // 失败也写审计：模型非法（400），此时还没到 chat 处理
+    const fail = await call(`${address.url}/v1/chat/completions`, {
+      method: 'POST',
+      body: baseBody({ model: 'gpt-4o', messages: [{ role: 'user', content: secretText }] }),
+      headers: { authorization: `Bearer ${created.key}` },
+    })
+    assert.equal(fail.status, 400)
+  })
+
+  const text = await readFile(auditPath, 'utf8')
+  const entries = text.trim().split('\n').map((line) => JSON.parse(line))
+  assert.equal(entries.length, 2, '成功与失败各一条')
+
+  const success = entries.find((entry) => entry.status === 200)
+  assert.ok(success !== undefined, `应有 200 的记录：${text}`)
+  assert.equal(success.keyId, created.id)
+  assert.equal(success.keySuffix, created.key.slice(-4))
+  assert.equal(success.model, 'mg:auto')
+  assert.equal(success.promptTokens, 8, 'prompt = input + cacheRead + cacheWrite')
+  assert.equal(success.completionTokens, 3)
+  assert.ok(typeof success.at === 'string' && success.at.includes('T'))
+
+  assert.ok(entries.some((entry) => entry.status === 400), '失败的请求也要留痕')
+  assert.ok(!text.includes(secretText), '审计绝不能含 messages 正文')
+  assert.ok(!text.includes(created.key), '审计绝不能含完整 Key')
+  assert.ok(!text.includes('mgw_live_'), '审计连 Key 前缀都不该有')
+})
+
+await test('TK-0003 审计写失败不影响主流程（只 warn）', async () => {
+  const dir = await freshDir()
+  const { keysPath } = pathsOf(dir)
+  // 把父路径做成「文件」，让 ensureDir 必然失败
+  const blocker = join(dir, 'blocker')
+  await writeFile(blocker, 'x', 'utf8')
+  const auditPath = join(blocker, 'nested', 'audit.ndjson')
+  const warns = []
+  const store = createKeyStore({ keysPath, auditPath, warn: (message) => warns.push(message) })
+  const created = await store.createKey('audit-broken')
+
+  await withGateway({
+    ctx: { llm: { stream: scriptedStream([
+      { type: 'text-delta', index: 0, text: 'ok' },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ]) } },
+    config: {},
+    keyStore: store,
+    warn: (message) => warns.push(message),
+  }, async (_gateway, address) => {
+    const res = await call(`${address.url}/v1/chat/completions`, {
+      method: 'POST',
+      body: baseBody(),
+      headers: { authorization: `Bearer ${created.key}` },
+    })
+    assert.equal(res.status, 200, '审计失败不能影响主流程')
+    assert.equal(res.json.choices[0].message.content, 'ok')
+    // 审计在响应结束后才写（旁路），轮询等它落
+    for (let i = 0; i < 50 && warns.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  })
+  assert.ok(warns.some((message) => message.includes('审计')), `应 warn 审计失败，实际：${warns.join('|')}`)
+})
+
+await test('TK-0003 多 Key 隔离：限流按 Key 分桶，互不影响', async () => {
+  const dir = await freshDir()
+  const store = createKeyStore(pathsOf(dir))
+  const keyA = await store.createKey('A')
+  const keyB = await store.createKey('B')
+
+  let entered
+  const enteredPromise = new Promise((resolve) => { entered = resolve })
+  let release
+  const hold = new Promise((resolve) => { release = resolve })
+
+  await withGateway({
+    ctx: { llm: { stream() {
+      return (async function* () {
+        entered()
+        await hold
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      })()
+    } } },
+    config: {},
+    keyStore: store,
+    limits: { concurrency: 1, perMinute: 100 },
+  }, async (_gateway, address) => {
+    const first = fetch(`${address.url}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${keyA.key}` },
+      body: JSON.stringify(baseBody()),
+    })
+    await enteredPromise
+
+    // A 已占满自己的桶 → A 429
+    const blockedA = await call(`${address.url}/v1/chat/completions`, {
+      method: 'POST', body: baseBody(), headers: { authorization: `Bearer ${keyA.key}` },
+    })
+    assert.equal(blockedA.status, 429)
+
+    release()
+    const firstRes = await first
+    await firstRes.text()
+    assert.equal(firstRes.status, 200)
+
+    // B 的桶是空的 → 200
+    const okB = await call(`${address.url}/v1/chat/completions`, {
+      method: 'POST',
+      body: baseBody(),
+      headers: { authorization: `Bearer ${keyB.key}` },
+    })
+    assert.equal(okB.status, 200, 'B 不该被 A 的并发占用影响')
   })
 })
 
