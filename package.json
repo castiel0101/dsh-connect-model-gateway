@@ -1,7 +1,7 @@
 {
   "name": "dsh-connect-model-gateway",
   "displayName": "魔桥 · DSH Model Gateway",
-  "version": "0.15.1",
+  "version": "0.15.2",
   "description": "魔桥（Model Gateway）：一个插件收进各家「积分换模型」的平台——WorkBuddy / CodeArts / 秒悟 Meoo / SCNet / 灵犀 / 商汤小浣熊。统一登录与账号池、积分余额、模型目录与开关、自动签到；Auto 模式按平台+账号+模型的优先级兜底换模型。",
   "type": "module",
   "license": "MIT",

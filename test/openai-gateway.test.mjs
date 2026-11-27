@@ -1199,6 +1199,68 @@ function parseSse(text) {
   })
 }
 
+await test('流式收尾：上游没发 finish 也必须补 finish_reason 帧', async () => {
+  // 真实事故：推理模型思考+正文都流完了，上游直接关连接没给 finish，
+  // 以前网关会静默跳过结束帧，客户端就永远停在「思考中」。
+  const chunks = [
+    { type: 'reasoning-delta', index: 0, text: '想好了' },
+    { type: 'block-end', index: 0, block: { type: 'reasoning', text: '想好了' } },
+    { type: 'text-delta', index: 1, text: '答案' },
+    { type: 'block-end', index: 1, block: { type: 'text', text: '答案' } },
+    // 注意：没有 finish chunk
+  ]
+  await withGateway({
+    ctx: { llm: { stream: scriptedStream(chunks) } },
+    config: {},
+  }, async (_gateway, address) => {
+    const { text } = await fetchSse(`${address.url}/v1/chat/completions`, baseBody({ stream: true }))
+    const frames = parseSse(text)
+    const finishers = frames.filter((f) => f.choices?.[0]?.finish_reason != null)
+    assert.equal(finishers.length, 1, '必须恰好一个带 finish_reason 的帧')
+    assert.equal(finishers[0].choices[0].finish_reason, 'stop')
+    assert.ok(text.trimEnd().endsWith('data: [DONE]'))
+  })
+})
+
+await test('流式收尾：finish=aborted 但客户端还连着，也要补结束帧', async () => {
+  const chunks = [
+    { type: 'text-delta', index: 1, text: '半个回答' },
+    { type: 'finish', reason: { kind: 'aborted' } },
+  ]
+  await withGateway({
+    ctx: { llm: { stream: scriptedStream(chunks) } },
+    config: {},
+  }, async (_gateway, address) => {
+    const { text } = await fetchSse(`${address.url}/v1/chat/completions`, baseBody({ stream: true }))
+    const frames = parseSse(text)
+    const finishers = frames.filter((f) => f.choices?.[0]?.finish_reason != null)
+    assert.equal(finishers.length, 1)
+    assert.equal(finishers[0].choices[0].finish_reason, 'stop')
+  })
+})
+
+await test('流式收尾：finish_reason 帧在 usage 帧与 [DONE] 之前', async () => {
+  const chunks = [
+    { type: 'text-delta', index: 1, text: 'hi' },
+    usageChunk,
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  await withGateway({
+    ctx: { llm: { stream: scriptedStream(chunks) } },
+    config: {},
+  }, async (_gateway, address) => {
+    const { text } = await fetchSse(`${address.url}/v1/chat/completions`, baseBody({
+      stream: true, stream_options: { include_usage: true },
+    }))
+    const frames = parseSse(text)
+    const finishIdx = frames.findIndex((f) => f.choices?.[0]?.finish_reason != null)
+    const usageIdx = frames.findIndex((f) => Array.isArray(f.choices) && f.choices.length === 0)
+    assert.ok(finishIdx >= 0 && usageIdx >= 0)
+    assert.ok(finishIdx < usageIdx, 'finish 帧必须在 usage 帧之前')
+    assert.ok(text.trimEnd().endsWith('data: [DONE]'))
+  })
+})
+
 await test('TK-0002 流式：头四项 + role 首帧 + 逐帧映射 + 严格 [DONE] + include_usage', async () => {
   const chunks = [
     { type: 'reasoning-delta', index: 0, text: '思考' },
@@ -1266,11 +1328,9 @@ await test('TK-0002 流式：不请求 usage 时无 usage 帧；aborted 不发 f
       const frames = parseSse(text)
       assert.equal(frames.at(-1).usage, undefined, '未请求 include_usage 不应发 usage 帧')
       const finishes = frames.filter((f) => f.choices[0]?.finish_reason)
-      if (reason.kind === 'aborted') {
-        assert.equal(finishes.length, 0)
-      } else {
-        assert.equal(finishes.at(-1).choices[0].finish_reason, 'stop')
-      }
+      // aborted 也补 stop：客户端还连着，缺结束帧会让界面卡在「思考中」
+      assert.equal(finishes.length, 1)
+      assert.equal(finishes.at(-1).choices[0].finish_reason, 'stop')
     })
   }
 })
