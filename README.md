@@ -198,7 +198,10 @@ token 还跟登录会话绑定：同一个账号在别处重新登录（或网�
 - 独立 HTTP server（不占 DSH 的 GUI webServer），**默认关闭**；升级插件不会自动开端口，需在设置页概览的网关行里手动打开
 - 默认只监听 `127.0.0.1:8765`；绑定地址可从回环与本机内网 IPv4 里选，端口/并发/频率每分钟可改，改完自动重启监听
 - Bearer 鉴权，多 Key 独立启停/吊销，只存 SHA-256 哈希；**完整 Key 只在创建时显示一次**，列表里永远只有 `prefix…suffix`，没有「复制」旧 Key 的入口
-- `model` 同时支持前缀式 `mg-<provider>:<model>` / `mg-auto` 与自定义别名（别名改完立即生效，无需重启）
+- `model` 支持 `mg-auto`、`mg-<provider>:<model>` 与自定义别名（三选一，别名改完立即生效）
+  - **0.15.0 起旧的 `mg:` 前缀不再接受**（返回 400 `model_not_found`），请改用 `mg-`。平台与模型之间仍是冒号，因为模型 id 本身常带冒号/斜杠（`org/model:v2`）
+- `GET /v1/models` 除 `id/object/created/owned_by` 外，还在有值时返回 `context_length`、`max_output_tokens`、`supports_vision`、`supports_tools`、`supports_reasoning`，调用方不用猜上下文预算和贴图能力
+- 设置页「模型」区块一行一个已启用模型，展示平台/上下文/能力，**别名直接在该行输入回车即可**，不用逐个开弹窗维护
 - 流式 / 非流式 `chat/completions`，工具调用、图片、reasoning；底层复用 `ctx.llm.stream`，Auto 兜底与账号隔离原样生效
 - 脱敏审计（不记消息正文）、每 Key 并发与频率限制；审计开关在「监听与安全」里
 - TLS 未实现，界面上禁用并标注风险
