@@ -1,8 +1,8 @@
 # 魔桥 · dsh-connect-model-gateway
 
-把 WorkBuddy、华为云 CodeArts、Meoo 秒悟、SCNet、WPS 灵犀、商汤小浣熊接进 DeepSeek Harness（DSH），在 DSH 里直接调用这些平台的模型。
+把 WorkBuddy、华为云 CodeArts、Meoo 秒悟、SCNet、WPS 灵犀、商汤小浣熊接进 DeepSeek Harness（DSH）：既能在 DSH 里直接调用这些平台的模型，也能通过内置的 OpenAI 兼容网关开放给外部 Agent 用标准 SDK 调用。
 
-包名 `dsh-connect-model-gateway`，设置页入口名为「魔桥」。
+包名 `dsh-connect-model-gateway`，设置页入口名为「魔桥」。设置页概览第一行是 OpenAI 网关开关，下面依次是 Auto 与各平台。
 
 ## 功能
 
@@ -13,6 +13,7 @@
 - **自动签到**：每小时检查一次，每个账号每天签一次；支持单个补签和一键全部签到，失败按退避重试。
 - **会话区账号胶囊**：当前会话选中魔桥的模型时，输入框旁显示「账号名 · 剩余积分」。渠道有多个账号时尾部带「切换」，点开列出该渠道全部账号与各自积分，点击即切换（对所有会话生效）。选中其他 provider 的模型时不显示。
 - **多平台并存**：六个 provider 各自注册，同一对话里可以分别选不同平台的模型，互不干扰。
+- **OpenAI 兼容网关**：独立 HTTP server 对外暴露标准 `/v1/chat/completions`、`/v1/models` 接口，外部 Agent 用 OpenAI 官方 SDK 即可调用六家平台的模型；支持 Bearer 多 Key、每 Key 限流、脱敏审计，默认关闭。详见 [OpenAI 网关](#openai-网关)。
 - **Auto 模式（兜底换模型）**：候选按「平台 + 账号 + 模型」三元组排优先级，首包前出错就换下一个——限流 429、积分用尽、掉登录、5xx、超时、断流、空回复。冷却按候选各自计算，冷却中的候选直接跳过不排队。一旦已经输出内容就锁定当前候选，不重放（否则界面会出现两段回答）。**Auto 只用候选绑定的账号，不动某个平台的全局当前账号**；手选具体模型的行为完全不变。
 - **不占用其他插件的槽位**：模型行显示由 DSH 原生组件负责，本插件不注册 `conversation.input.model.label`。
 
@@ -23,7 +24,7 @@
 dsh plugin add dsh-connect-model-gateway
 
 # 从仓库安装
-dsh plugin add github:JackLeo/dsh-connect-model-gateway
+dsh plugin add github:castiel0101/dsh-connect-model-gateway
 
 # 本地目录
 dsh plugin --profile desktop add /绝对路径/dsh-connect-model-gateway
@@ -37,6 +38,13 @@ dsh plugin --profile desktop add /绝对路径/dsh-connect-model-gateway
 2. 在对应平台页签里点登录，按各平台要求完成授权（扫码、OAuth、短信验证码或独立浏览器窗口）。
 3. 在「模型」里勾选要用的模型。默认一个都不勾。
 4. 新建对话，provider 选相应平台，再选模型。
+
+**对外开放给 Agent**（OpenAI 网关）：
+
+1. 设置 → 魔桥 → 概览第一行「OpenAI 网关」，打开右侧开关（默认关闭）。
+2. 点「管理」→「访问 Key」→「+ 新增 Key」，创建后立即复制完整 Key（**只显示这一次**）。
+3. 在「接入信息」复制 Base URL（形如 `http://127.0.0.1:8765/v1`）。
+4. 外部 Agent 把 `base_url` 填成它、`api_key` 填成刚才的 Key，`model` 用 `mg-auto` 或 `mg-<平台>:<模型>` 即可。完整示例见 [OpenAI 网关](#openai-网关)。
 
 账号与模型开关保存在 `~/.dsh/model-pool/<provider>.json`，原子写，权限 `0600`。Auto 的候选与策略另存 `~/.dsh/model-pool/auto.json`，与平台状态互不相干。卸载插件不会删除这些文件。
 
@@ -72,22 +80,28 @@ provider 键沿用旧插件的值，改名时未改动，已有会话的模型�
 六个平台的登录、余额、目录、签到、设置页各实现一次，平台差异收敛在适配器层。适配器无状态：凭证由 manager 传入，数据返回；账号池、切换、持久化在 `lib/core/manager.js`。
 
 ```
-DSH 对话窗口
-   │  OpenAI /chat/completions 格式, Bearer=<本进程随机密钥>
-   ▼
-魔桥本地 shim（127.0.0.1:随机端口，仅 CodeArts / WorkBuddy / 灵犀）
-   │  补签名 / 改信封 / SSE 翻译
-   ▼
+DSH 对话窗口                         外部 Agent（OpenAI SDK）
+   │  OpenAI /chat/completions 格式        │  OpenAI /v1/chat/completions + Bearer Key
+   │  Bearer=<本进程随机密钥>               │
+   ▼                                      ▼
+魔桥本地 shim（127.0.0.1:随机端口）     OpenAI 网关（默认 127.0.0.1:8765，默认关闭）
+   │  仅 CodeArts / WorkBuddy / 灵犀       │  鉴权 / 限流 / 模型名解析 / SSE 与用量映射
+   │  补签名 / 改信封 / SSE 翻译            │
+   └──────────────┬───────────────────────┘
+                  ▼
 各平台推理端点
 ```
 
-shim 只监听回环地址，校验 Host 与进程随机密钥，进程退出即关闭。
+shim 与网关都只监听回环地址（网关可改绑内网 IPv4）；shim 校验 Host 与进程随机密钥，进程退出即关闭。网关需在设置页手动开启，且同样默认只绑回环。
 
 ```
 lib/
   index.js                  Host：provider 注册、模型清单重建、刷新与签到调度、HTTP 路由
   client.js                 浏览器：设置页「魔桥」与会话区积分胶囊
   core/adapter.js           适配器契约
+  core/openai-protocol.js   OpenAI 协议层：模型名解析、消息/工具/参数映射、错误信封、SSE 分帧
+  core/openai-gateway.js    网关 HTTP server：端点、鉴权、限流、BlockAssembler 组装
+  core/gateway-keys.js      Key 存储（SHA-256 + 首尾标识）与脱敏审计
   core/manager.js           账号池、当前账号、模型开关、刷新与签到
   core/state.js             每平台状态落盘（原子写，0600）
   core/host-peers.js        宿主包运行期解析（app.asar 回退）
@@ -193,7 +207,27 @@ token 还跟登录会话绑定：同一个账号在别处重新登录（或网�
 
 ## OpenAI 网关
 
-对外暴露 OpenAI 兼容协议，让外部 Agent 用标准 SDK 调用魔桥里的模型。界面设计见 [openai-gateway-design-v3.html](../model-pool/openai-gateway-design-v3.html)。
+对外暴露 OpenAI 兼容协议，让外部 Agent 用标准 SDK 调用魔桥里的模型。
+
+### 快速开始
+
+先在设置页概览第一行打开网关开关、创建 Key（明文只显示一次），然后用任意 OpenAI SDK 调用：
+
+```sh
+curl http://127.0.0.1:8765/v1/chat/completions \
+  -H "Authorization: Bearer mgw_live_你的Key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mg-auto","messages":[{"role":"user","content":"你好"}]}'
+```
+
+Python：
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8765/v1", api_key="mgw_live_你的Key")
+print(client.chat.completions.create(
+    model="mg-auto", messages=[{"role": "user", "content": "你好"}]
+).choices[0].message.content)
+```
 
 - 独立 HTTP server（不占 DSH 的 GUI webServer），**默认关闭**；升级插件不会自动开端口，需在设置页概览的网关行里手动打开
 - 默认只监听 `127.0.0.1:8765`；绑定地址可从回环与本机内网 IPv4 里选，端口/并发/频率每分钟可改，改完自动重启监听
@@ -206,7 +240,7 @@ token 还跟登录会话绑定：同一个账号在别处重新登录（或网�
 - 脱敏审计（不记消息正文）、每 Key 并发与频率限制；审计开关在「监听与安全」里
 - TLS 未实现，界面上禁用并标注风险
 
-设置页概览默认是**列表式**：一行一条，OpenAI 网关置顶，其后是 Auto 与各平台，每行带状态点、状态标签、关键指标和管理按钮。hero 右侧可在列表 / 卡片之间切换，选择存进 `localStorage`（`dsh-connect-model-gateway:prefs` 的 `overviewLayout`，默认 `list`）；切到卡片式复用原来的 Auto 卡与平台卡。
+设置页概览默认是**列表式**：一行一条，OpenAI 网关置顶，其后是 Auto 与各平台，每行带状态点、状态标签、关键指标和管理按钮。右上角可在列表 / 卡片之间切换，选择会被记住。
 
 网关配置存在 `~/.dsh/model-pool/gateway-settings.json`（`0600`，含 enabled/bind/port/限流/审计开关/别名），Key 与审计分别在 `gateway.json`、`gateway-audit.ndjson`。三者都在 `~/.dsh/model-pool/` 下，卸载插件不删除。
 
