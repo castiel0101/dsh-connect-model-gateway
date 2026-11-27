@@ -74,6 +74,19 @@
     "vision": "Vision",
     "thinking": "Thinking",
     "tools": "Tools",
-    "noModels": "No models enabled yet. Tick some in the platform tabs first."
+    "noModels": "No models enabled yet. Tick some in the platform tabs first.",
+    "version": "Version",
+    "checkUpdate": "Check for updates",
+    "checking": "Checking…",
+    "upToDate": "Up to date",
+    "updateAvailable": "Update available",
+    "updateTitle": "New version available",
+    "updateCurrent": "Current",
+    "updateLatest": "Latest",
+    "updateChanges": "What's new",
+    "updateNoChanges": "Could not fetch release notes (GitHub API unreachable)",
+    "updateCommand": "Run this in a terminal to update",
+    "updateHint": "This phase only notifies: updating replaces plugin files, so installing it yourself is safer.",
+    "updateCheckFail": "Check failed, try again later"
   }
 }
