@@ -45,7 +45,7 @@ dsh plugin --profile desktop add /绝对路径/dsh-connect-model-gateway
 1. 设置 → 魔桥 → 概览里的「Auto 模式」→ 管理。
 2. 点「+ 添加候选」，选平台 → 账号 → 模型（可多选）。**同一个「平台 + 账号 + 模型」不能重复添加**；同名模型换账号属于另一条候选，会各自计费、各自冷却。平台一栏除了魔桥接入的六家，还列出 DSH 自带和你自己配的所有 provider——它们不需要选账号，用各自原有的配置。
 3. 用 ↑ ↓ 调优先级，从上到下依次尝试。
-4. 「什么时候切换」决定哪些失败值得换下一个。默认勾限流、积分用尽、登录失效、5xx、超时/断流、空回复；参数错误 400 和上下文超限默认不勾（换模型可能蒙过，但会掩盖真问题）。
+4. 「什么时候切换」决定哪些失败值得换下一个。默认勾限流、积分用尽、登录失效、5xx、超时/断流、空回复；参数错误 400 和上下文超限默认不勾（换模型可能蒙过，但会掩盖真问题）。请求侧的前置校验错误（如 `IMAGE_OFFLOAD_REQUIRED`：会话保留图片超出路由预算）**永远不切换**，Auto 会把 failure 原样上抛（保留 `offloadImages`），交给宿主的图片卸载插件卸载旧图后重试整步。
 5. 新建对话时在选择器里选「Auto 模式」。用了哪个账号和模型，会显示在输入框的胶囊里；点开能看本轮的路由轨迹。
 
 三条硬约束：
@@ -190,6 +190,24 @@ token 还跟登录会话绑定：同一个账号在别处重新登录（或网�
 目录里 `visible: false` 的 `raccoon-xxxxxx` 是 App 内建路由位，不是能对话的模型，过滤掉。倍率取 `billing_effective_multiplier`（促销时用折后价），`billing_status: limited_free` 且倍率为 0 的显示「限时免费」。模型识图能力按实测结论写死：GLM-5.3 目录标着 vision 却看不了图，GLM-5.3-Flash 与 DeepSeek-V4.1-Flash 没标却能看。
 
 业务错误码按 HTTP 语义归一：会话失效 `200001/200003/200822` → 401，额度耗尽 `200402/200429/100402` → 402，限流文案 → 429。上游多数失败是 400 加业务码，先读 code 再看 status。
+
+## OpenAI 网关
+
+对外暴露 OpenAI 兼容协议，让外部 Agent 用标准 SDK 调用魔桥里的模型。界面设计见 [openai-gateway-design-v3.html](../model-pool/openai-gateway-design-v3.html)。
+
+- 独立 HTTP server（不占 DSH 的 GUI webServer），**默认关闭**；升级插件不会自动开端口，需在设置页概览的网关行里手动打开
+- 默认只监听 `127.0.0.1:8765`；绑定地址可从回环与本机内网 IPv4 里选，端口/并发/频率每分钟可改，改完自动重启监听
+- Bearer 鉴权，多 Key 独立启停/吊销，只存 SHA-256 哈希；**完整 Key 只在创建时显示一次**，列表里永远只有 `prefix…suffix`，没有「复制」旧 Key 的入口
+- `model` 同时支持前缀式 `mg:<provider>:<model>` / `mg:auto` 与自定义别名（别名改完立即生效，无需重启）
+- 流式 / 非流式 `chat/completions`，工具调用、图片、reasoning；底层复用 `ctx.llm.stream`，Auto 兜底与账号隔离原样生效
+- 脱敏审计（不记消息正文）、每 Key 并发与频率限制；审计开关在「监听与安全」里
+- TLS 未实现，界面上禁用并标注风险
+
+设置页概览默认是**列表式**：一行一条，OpenAI 网关置顶，其后是 Auto 与各平台，每行带状态点、状态标签、关键指标和管理按钮。hero 右侧可在列表 / 卡片之间切换，选择存进 `localStorage`（`dsh-connect-model-gateway:prefs` 的 `overviewLayout`，默认 `list`）；切到卡片式复用原来的 Auto 卡与平台卡。
+
+网关配置存在 `~/.dsh/model-pool/gateway-settings.json`（`0600`，含 enabled/bind/port/限流/审计开关/别名），Key 与审计分别在 `gateway.json`、`gateway-audit.ndjson`。三者都在 `~/.dsh/model-pool/` 下，卸载插件不删除。
+
+> 六家平台为私有接口、按使用者账号扣积分；请将网关限制在本机/可信内网自用。
 
 ## 已知限制
 
