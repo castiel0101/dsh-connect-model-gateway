@@ -64,7 +64,7 @@
     "addAliasTitle": "New alias",
     "aliasPlaceholder": "e.g. gpt-4o",
     "targetPlaceholder": "mg-auto or mg-workbuddy:model",
-    "warning": "⚠ These six platforms are private APIs billed to your own accounts; for personal research only, no commercial use.",
+    "warning": "⚠ These seven platforms are private APIs billed to your own accounts; for personal research only, no commercial use.",
     "errorPrefix": "Gateway error: ",
     "models": "Models",
     "modelsHint": "One alias per model: type in the row and press Enter; click × to remove and set another.",

@@ -31,6 +31,7 @@ import {
 } from '../lib/core/openai-protocol.js'
 import { createGateway } from '../lib/core/openai-gateway.js'
 import { createKeyStore } from '../lib/core/gateway-keys.js'
+import { truncationMessage } from '../lib/core/openai-protocol.js'
 
 // ------------------------------------------------------- TK-0003 测试夹具
 //
@@ -1193,15 +1194,21 @@ function parseSse(text) {
   const last = blocks.pop()
   assert.equal(text.endsWith('data: [DONE]\n\n'), true, '末行必须是严格 data: [DONE]')
   assert.equal(last, '', '最后一帧后只剩空串')
-  return blocks.filter((block) => block !== 'data: [DONE]').map((block) => {
-    assert.ok(block.startsWith('data: '), `非法 SSE 帧：${block}`)
-    return JSON.parse(block.slice(6))
-  })
+  return blocks
+    .filter((block) => block !== 'data: [DONE]')
+    // SSE 注释帧（心跳 `: ping`）按规范不是数据，解析时整体跳过
+    .filter((block) => !block.startsWith(':'))
+    .map((block) => {
+      assert.ok(block.startsWith('data: '), `非法 SSE 帧：${block}`)
+      return JSON.parse(block.slice(6))
+    })
 }
 
-await test('流式收尾：上游没发 finish 也必须补 finish_reason 帧', async () => {
-  // 真实事故：推理模型思考+正文都流完了，上游直接关连接没给 finish，
-  // 以前网关会静默跳过结束帧，客户端就永远停在「思考中」。
+await test('流式收尾：上游没发 finish → 补 error 信封，绝不伪装成 finish_reason=stop', async () => {
+  // 真实事故：推理模型思考+正文都流完了，上游直接关连接没给 finish。
+  // 早期实现（4a0c58c）在这里补 finish_reason:'stop'，等于把半截回答伪装成
+  // 完整回答：客户端不报错、不重试，用户拿到静默截断的答案。现在必须发
+  // error 信封（宿主据此判 TRANSPORT，llm-retry 才能重试），且不得有 finish 帧。
   const chunks = [
     { type: 'reasoning-delta', index: 0, text: '想好了' },
     { type: 'block-end', index: 0, block: { type: 'reasoning', text: '想好了' } },
@@ -1209,17 +1216,139 @@ await test('流式收尾：上游没发 finish 也必须补 finish_reason 帧', 
     { type: 'block-end', index: 1, block: { type: 'text', text: '答案' } },
     // 注意：没有 finish chunk
   ]
+  const warns = []
   await withGateway({
     ctx: { llm: { stream: scriptedStream(chunks) } },
     config: {},
+    warn: (message) => warns.push(message),
+  }, async (_gateway, address) => {
+    const { res, text } = await fetchSse(`${address.url}/v1/chat/completions`, baseBody({ stream: true }))
+    assert.equal(res.status, 200, '已发 200 后不能改状态码')
+    const frames = parseSse(text)
+    assert.equal(
+      frames.filter((f) => f.choices?.[0]?.finish_reason != null).length,
+      0,
+      '截断时不能出现 finish_reason 帧',
+    )
+    const errorFrame = frames.find((f) => f.error !== undefined)
+    assert.ok(errorFrame, '截断必须补 error 信封')
+    assert.equal(errorFrame.error.code, 'upstream_stream_truncated')
+    assert.ok(text.trimEnd().endsWith('data: [DONE]'))
+    assert.ok(warns.some((line) => line.includes('截断')), '截断要留日志')
+  })
+})
+
+await test('截断文案必须能被宿主判成 TRANSPORT（否则 llm-retry 根本不会重试）', async () => {
+  // 宿主 dsh-llm-pi-ai 的 classifyPiAiError **只看 message 文本**，不看 code：
+  //   /stream ended (?:before|without)\b/i                    → TRANSPORT
+  //   /\b(?:network|connection|socket|fetch)\b|…/             → TRANSPORT
+  // 文案若退化成纯中文，就被归成 PI_AI_ERROR（不可重试），这轮修复等于没做。
+  const HOST_STREAM_TRUNCATION = /stream ended (?:before|without)\b/i
+  const HOST_CONNECTION = /\b(?:network|connection|socket|fetch)\b|\bECONN[A-Z]+\b/i
+  const base = truncationMessage()
+  const withDetail = truncationMessage('upstream said: terminated')
+
+  for (const [label, message] of [['无 detail', base], ['带 detail', withDetail]]) {
+    assert.ok(
+      HOST_STREAM_TRUNCATION.test(message) || HOST_CONNECTION.test(message),
+      `${label}：截断文案必须命中宿主的 TRANSPORT 正则，实际 ${JSON.stringify(message)}`,
+    )
+  }
+  // 脱敏照旧：detail 里的凭据不能进响应体
+  assert.ok(!truncationMessage('token=abcdef123456').includes('abcdef123456'))
+  // 保留中文，方便用户看懂
+  assert.match(base, /中断/)
+})
+
+await test('流式心跳：上游思考期不吐帧时，连接上必须持续出现 SSE 注释帧', async () => {
+  // 网关绑局域网 IP，中间 NAT/反代会按 idle timeout 掐连接。上游思考期几十秒
+  // 没字节时唯一能保活的就是注释帧（`: ping`），OpenAI SDK 解码器会跳过它。
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  const chunks = [
+    { type: 'text-delta', index: 0, text: '前半' },
+    // 思考/生成中的长空档：远超心跳间隔
+    { type: 'text-delta', index: 0, text: '后半' },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  const stalled = function stream() {
+    let index = 0
+    return {
+      [Symbol.asyncIterator]() { return this },
+      async next() {
+        if (index === 1) await delay(120)
+        if (index >= chunks.length) return { value: undefined, done: true }
+        return { value: chunks[index++], done: false }
+      },
+      return() { return Promise.resolve({ value: undefined, done: true }) },
+    }
+  }
+  await withGateway({
+    ctx: { llm: { stream: stalled } },
+    config: { sseHeartbeatMs: 20 },
   }, async (_gateway, address) => {
     const { text } = await fetchSse(`${address.url}/v1/chat/completions`, baseBody({ stream: true }))
+    const pings = text.split('\n\n').filter((block) => block === ': ping')
+    assert.ok(pings.length >= 2, `思考期应有多次心跳，实际 ${pings.length}`)
+    // 心跳不能污染内容：正文与收尾帧照旧
     const frames = parseSse(text)
-    const finishers = frames.filter((f) => f.choices?.[0]?.finish_reason != null)
-    assert.equal(finishers.length, 1, '必须恰好一个带 finish_reason 的帧')
-    assert.equal(finishers[0].choices[0].finish_reason, 'stop')
-    assert.ok(text.trimEnd().endsWith('data: [DONE]'))
+    const content = frames.map((f) => f.choices?.[0]?.delta?.content ?? '').join('')
+    assert.equal(content, '前半后半')
+    assert.equal(frames.filter((f) => f.choices?.[0]?.finish_reason).length, 1)
   })
+})
+
+await test('流式心跳：流结束后不再发心跳（不往已收尾的响应写）', async () => {
+  await withGateway({
+    ctx: { llm: { stream: scriptedStream([
+      { type: 'text-delta', index: 0, text: 'hi' },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ]) } },
+    config: { sseHeartbeatMs: 10 },
+  }, async (_gateway, address) => {
+    const { text } = await fetchSse(`${address.url}/v1/chat/completions`, baseBody({ stream: true }))
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    assert.ok(text.trimEnd().endsWith('data: [DONE]'), '收尾必须是 [DONE]，心跳不能跑到它后面')
+    assert.ok(!text.includes(': ping'), '快流不该产生心跳')
+  })
+})
+
+await test('审计：截断的流记 outcome=truncated，正常流记 ok', async () => {
+  const dir = await freshDir()
+  const auditPath = join(dir, 'gateway-audit.ndjson')
+  // 截断：只有正文没有 finish
+  await withGateway({
+    ctx: { llm: { stream: scriptedStream([{ type: 'text-delta', index: 0, text: '半截' }]) } },
+    config: {},
+    auditPath,
+    warn: () => {},
+  }, async (_gateway, address) => {
+    await fetchSse(`${address.url}/v1/chat/completions`, baseBody({ stream: true }))
+  })
+  // 正常：带 finish
+  await withGateway({
+    ctx: { llm: { stream: scriptedStream([
+      { type: 'text-delta', index: 0, text: '完整' },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ]) } },
+    config: {},
+    auditPath,
+    warn: () => {},
+  }, async (_gateway, address) => {
+    await fetchSse(`${address.url}/v1/chat/completions`, baseBody({ stream: true }))
+  })
+
+  // 审计在响应收尾之后的 finally 里写，和客户端拿到最后一个字节有微小竞态：轮询等落盘
+  let lines = []
+  for (let i = 0; i < 50; i += 1) {
+    const raw = await readFile(auditPath, 'utf8').catch(() => '')
+    lines = raw.trim() === '' ? [] : raw.trim().split('\n').map((line) => JSON.parse(line))
+    if (lines.length >= 2) break
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  assert.equal(lines.length, 2, `应有两条审计，实际 ${lines.length}`)
+  // 两条的 status 都是 200 —— 正是线上那条「200 + tokens=0」看不出问题的根因
+  assert.deepEqual(lines.map((line) => line.status), [200, 200])
+  assert.deepEqual(lines.map((line) => line.outcome), ['truncated', 'ok'])
 })
 
 await test('流式收尾：finish=aborted 但客户端还连着，也要补结束帧', async () => {
@@ -1548,8 +1677,10 @@ await test('TK-0003 appendAudit：只写白名单字段，多传的正文/Key/�
   assert.equal(lines.length, 1)
   const entry = JSON.parse(lines[0])
   assert.deepEqual(Object.keys(entry).sort(), [
-    'account', 'at', 'completionTokens', 'keyId', 'keySuffix', 'model', 'promptTokens', 'status',
+    'account', 'at', 'completionTokens', 'keyId', 'keySuffix', 'model', 'outcome', 'promptTokens', 'status',
   ])
+  // outcome 只收枚举值，乱传一律落 unknown（防止它变成自由文本通道）
+  assert.equal(entry.outcome, 'unknown', '未给 outcome 时写 unknown')
   assert.equal(entry.keyId, created.id)
   assert.equal(entry.model, 'mg-auto')
   assert.equal(entry.promptTokens, 11)

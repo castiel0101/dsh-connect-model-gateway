@@ -1,6 +1,6 @@
 # 魔桥 · dsh-connect-model-gateway
 
-把 WorkBuddy、华为云 CodeArts、Meoo 秒悟、SCNet、WPS 灵犀、商汤小浣熊接进 DeepSeek Harness（DSH）：既能在 DSH 里直接调用这些平台的模型，也能通过内置的 OpenAI 兼容网关开放给外部 Agent 用标准 SDK 调用。
+把 WorkBuddy、华为云 CodeArts、Meoo 秒悟、SCNet、WPS 灵犀、商汤小浣熊、豆包接进 DeepSeek Harness（DSH）：既能在 DSH 里直接调用这些平台的模型，也能通过内置的 OpenAI 兼容网关开放给外部 Agent 用标准 SDK 调用。
 
 包名 `dsh-connect-model-gateway`，设置页入口名为「魔桥」。设置页概览第一行是 OpenAI 网关开关，下面依次是 Auto 与各平台。
 
@@ -12,8 +12,8 @@
 - **模型目录与开关**：启动和每小时各拉一次上游模型目录。模型默认不勾选，勾选过的才进 DSH 选择器；可逐模型设置上下文窗口、图片输入、思考档位。
 - **自动签到**：每小时检查一次，每个账号每天签一次；支持单个补签和一键全部签到，失败按退避重试。
 - **会话区账号胶囊**：当前会话选中魔桥的模型时，输入框旁显示「账号名 · 剩余积分」。渠道有多个账号时尾部带「切换」，点开列出该渠道全部账号与各自积分，点击即切换（对所有会话生效）。选中其他 provider 的模型时不显示。
-- **多平台并存**：六个 provider 各自注册，同一对话里可以分别选不同平台的模型，互不干扰。
-- **OpenAI 兼容网关**：独立 HTTP server 对外暴露标准 `/v1/chat/completions`、`/v1/models` 接口，外部 Agent 用 OpenAI 官方 SDK 即可调用六家平台的模型；支持 Bearer 多 Key、每 Key 限流、脱敏审计，默认关闭。详见 [OpenAI 网关](#openai-网关)。
+- **多平台并存**：七个 provider 各自注册，同一对话里可以分别选不同平台的模型，互不干扰。
+- **OpenAI 兼容网关**：独立 HTTP server 对外暴露标准 `/v1/chat/completions`、`/v1/models` 接口，外部 Agent 用 OpenAI 官方 SDK 即可调用七家平台的模型；支持 Bearer 多 Key、每 Key 限流、脱敏审计，默认关闭。详见 [OpenAI 网关](#openai-网关)。
 - **Auto 模式（兜底换模型）**：候选按「平台 + 账号 + 模型」三元组排优先级，首包前出错就换下一个——限流 429、积分用尽、掉登录、5xx、超时、断流、空回复。冷却按候选各自计算，冷却中的候选直接跳过不排队。一旦已经输出内容就锁定当前候选，不重放（否则界面会出现两段回答）。**Auto 只用候选绑定的账号，不动某个平台的全局当前账号**；手选具体模型的行为完全不变。
 - **不占用其他插件的槽位**：模型行显示由 DSH 原生组件负责，本插件不注册 `conversation.input.model.label`。
 
@@ -51,7 +51,7 @@ dsh plugin --profile desktop add /绝对路径/dsh-connect-model-gateway
 ### Auto 模式
 
 1. 设置 → 魔桥 → 概览里的「Auto 模式」→ 管理。
-2. 点「+ 添加候选」，选平台 → 账号 → 模型（可多选）。**同一个「平台 + 账号 + 模型」不能重复添加**；同名模型换账号属于另一条候选，会各自计费、各自冷却。平台一栏除了魔桥接入的六家，还列出 DSH 自带和你自己配的所有 provider——它们不需要选账号，用各自原有的配置。
+2. 点「+ 添加候选」，选平台 → 账号 → 模型（可多选）。**同一个「平台 + 账号 + 模型」不能重复添加**；同名模型换账号属于另一条候选，会各自计费、各自冷却。平台一栏除了魔桥接入的七家，还列出 DSH 自带和你自己配的所有 provider——它们不需要选账号，用各自原有的配置。
 3. 用 ↑ ↓ 调优先级，从上到下依次尝试。
 4. 「什么时候切换」决定哪些失败值得换下一个。默认勾限流、积分用尽、登录失效、5xx、超时/断流、空回复；参数错误 400 和上下文超限默认不勾（换模型可能蒙过，但会掩盖真问题）。请求侧的前置校验错误（如 `IMAGE_OFFLOAD_REQUIRED`：会话保留图片超出路由预算）**永远不切换**，Auto 会把 failure 原样上抛（保留 `offloadImages`），交给宿主的图片卸载插件卸载旧图后重试整步。
 5. 新建对话时在选择器里选「Auto 模式」。用了哪个账号和模型，会显示在输入框的胶囊里；点开能看本轮的路由轨迹。
@@ -72,12 +72,13 @@ dsh plugin --profile desktop add /绝对路径/dsh-connect-model-gateway
 | SCNet | `scnet` | 手机号 + 短信验证码 | 无余额接口、不扣积分，显示 ♾️ 不限量 | 无 |
 | WPS 灵犀 | `lingxi` | 独立临时浏览器窗口登录，插件只读 `wps_sid` | 智点，15 天内过期提示 | 任务领取 |
 | 商汤小浣熊 | `raccoon` | 独立临时浏览器窗口，微信扫码登录 | 可用积分 | 无 |
+| 豆包 | `doubao` | 独立临时浏览器窗口扫码登录（cookie 本机加密） | 订阅套餐 / 赠送额度（按百分比窗口） | 无 |
 
 provider 键沿用旧插件的值，改名时未改动，已有会话的模型引用继续有效。Auto 注册的是独立 provider 键 `auto`，只有一个模型条目 `auto`。
 
 ## 架构
 
-六个平台的登录、余额、目录、签到、设置页各实现一次，平台差异收敛在适配器层。适配器无状态：凭证由 manager 传入，数据返回；账号池、切换、持久化在 `lib/core/manager.js`。
+七个平台的登录、余额、目录、签到、设置页各实现一次，平台差异收敛在适配器层。适配器无状态：凭证由 manager 传入，数据返回；账号池、切换、持久化在 `lib/core/manager.js`。
 
 ```
 DSH 对话窗口                         外部 Agent（OpenAI SDK）
@@ -85,7 +86,7 @@ DSH 对话窗口                         外部 Agent（OpenAI SDK）
    │  Bearer=<本进程随机密钥>               │
    ▼                                      ▼
 魔桥本地 shim（127.0.0.1:随机端口）     OpenAI 网关（默认 127.0.0.1:8765，默认关闭）
-   │  仅 CodeArts / WorkBuddy / 灵犀       │  鉴权 / 限流 / 模型名解析 / SSE 与用量映射
+   │  CodeArts / WorkBuddy / 灵犀 / 豆包  │  鉴权 / 限流 / 模型名解析 / SSE 与用量映射
    │  补签名 / 改信封 / SSE 翻译            │
    └──────────────┬───────────────────────┘
                   ▼
@@ -109,8 +110,13 @@ lib/
   core/shim.js              CodeArts 本地转发端点（补 AK/SK 签名）
   core/workbuddy-shim.js    WorkBuddy 本地转发端点（信封归一化 + 重试阶梯）
   core/lingxi-shim.js       灵犀三步握手 + SSE 翻译
+  core/doubao-shim.js       豆包私有 SSE 帧翻译 + 生图 Markdown + 思考档位
+  core/doubao-upstream.js   豆包 /chat/completion 协议、块遍历、风控分类
+  core/doubao-discovery.js  模型菜单发现（brief_list）与逐模型思考档
+  core/doubao-auth.js       浏览器扫码 cookie + 本机 AES-GCM / DPAPI 密封
   core/retry-fetch.js       SCNet 四类抖动归一化 + context 净化
   adapters/raccoon.js       小浣熊适配器（直连网关，浏览器扫码登录）
+  adapters/doubao.js        豆包适配器（单账号，cookie 由 shim 现读）
   adapters/*.js             每平台一个无状态适配器
 ```
 
@@ -205,6 +211,24 @@ token 还跟登录会话绑定：同一个账号在别处重新登录（或网�
 
 业务错误码按 HTTP 语义归一：会话失效 `200001/200003/200822` → 401，额度耗尽 `200402/200429/100402` → 402，限流文案 → 429。上游多数失败是 400 加业务码，先读 code 再看 status。
 
+### 豆包
+
+| 用途 | 端点 |
+|---|---|
+| 登录 | 独立临时浏览器 profile 打开 `https://www.doubao.com/chat/`，扫码后 CDP 读 `doubao.com` 域 cookie；本机 AES-256-GCM（macOS 密钥在 Keychain）/ DPAPI（Windows）密封，不读日常浏览器 cookie |
+| 推理 | `POST https://www.doubao.com/chat/completion`，字节三行帧（`id:` / `event:` / `data:` + 空行），不是标准 SSE，必须走本地 shim 翻译 |
+| 模型目录 | `POST https://www.doubao.com/alice/slot/action_bar_v3/brief_list` → `data.entry_list[].active_switch_conf.menu_conf_v2.model_list.item_list[]`；失败退桌面 `Preferences` 缓存再退静态目录 |
+| 积分 | `POST https://www.doubao.com/alice/commerce/sale/subscription/quota/summary/` `{"product_line":"membership"}` → 百分比窗口；无整数积分 |
+| 签到 | 无 |
+
+三个必须保留的语义：
+
+1. **生图不是模型，是技能。** `image-gen` 是 DSH 侧的别名，选中后仍走 chat 端点，靠 `ext.input_skill = '{"skill_id":"3","skill_type":3,"variables":{}}'`（JSON **字符串**）让豆包回 `creation_block`（`block_type: 2074`）。prompt 只取最后一条不含框架标记的用户消息并加 `生成图片：` 前缀，否则框架文字会被画进图里或请求卡住。图片落盘到 `~/.dsh/doubao-images/`，以 Markdown 图片形式返回（OpenAI 助手侧没有图片位置）。URL 优先级 `image_ori_raw`（无水印）> `image_ori` > `image_preview` > `image_thumb`。
+2. **思考档位逐模型。** `reasoning_effort` 3/4/5/6/7 = 低/中/高/极高/最高，同时也是 `need_deep_think - 10000`。只发档位不发 `ext.use_deep_think='1'` 不生效。「豆包 快速」(`0`) 实测永不思考，不向它提供思考旋钮。菜单给每个模型单独下发可选档位，共用一套会有一个模型选到不支持的档。
+3. **风控不是限流。** `710022004` 要人工滑块，本地开 1 小时冷却且绝不重试；`710012001` 是登录态失效，`710020202` 可能是续聊线程失效（换不带 `conversation_id` 的新会话重试一次）或请求体超 256 KiB（不可重试）。UA 必须带 `SamanthaDoubao/<version>` 后缀、`Referer: chrome://doubao-chat/`、`sec-ch-ua` 与浏览器身份一致。
+
+豆包只做一个账号：cookie 与浏览器身份绑定，多账号轮换会被风控串成同一台机器；换号请重新扫码。
+
 ## OpenAI 网关
 
 对外暴露 OpenAI 兼容协议，让外部 Agent 用标准 SDK 调用魔桥里的模型。
@@ -244,16 +268,16 @@ print(client.chat.completions.create(
 
 网关配置存在 `~/.dsh/model-pool/gateway-settings.json`（`0600`，含 enabled/bind/port/限流/审计开关/别名），Key 与审计分别在 `gateway.json`、`gateway-audit.ndjson`。三者都在 `~/.dsh/model-pool/` 下，卸载插件不删除。
 
-> 六家平台为私有接口、按使用者账号扣积分；请将网关限制在本机/可信内网自用。
+> 七家平台为私有接口、按使用者账号扣积分；请将网关限制在本机/可信内网自用。
 
 ## 已知限制
 
-- 六个平台都没有公开 API，本插件调用的是客户端和网页在用的私有接口。上游改动会导致对应平台失效；修复取决于社区跟进。
+- 七个平台都没有公开 API，本插件调用的是客户端和网页在用的私有接口。上游改动会导致对应平台失效；修复取决于社区跟进。
 - 自动签到、token 续期、多账号切换、复用浏览器 cookie 可能被平台识别为非官方客户端，后果从重新登录到停号、清积分不等。企业版 / 教育版席位的权益规则另算。
 - 账号与凭证明文存放在 `~/.dsh/model-pool/*.json`（`0600`）。不要同步到网盘，不要在公用机器上使用。插件没有后端，不上传凭证。
 - 推理按各平台倍率扣使用者账号的积分，签到奖励不可撤销。不自动换号，不跨模型 failover。
 - 各平台积分单位不同，界面按各自原值显示，不做换算。
-- CodeArts、WorkBuddy、灵犀在 `127.0.0.1` 起临时转发端点，随机 bearer + Host 校验，进程退出即关闭；同机同用户的其他进程理论上可访问。
+- CodeArts、WorkBuddy、灵犀、豆包在 `127.0.0.1` 起临时转发端点，随机 bearer + Host 校验，进程退出即关闭；同机同用户的其他进程理论上可访问。
 - 适配器互相独立，一家失效不会拖垮其他平台；上游改接口需按平台逐个跟进。
 - 小浣熊网页登录态有效期 30 天且没有 refresh_token，只能重新扫码；登录用的临时浏览器窗口在插件设置页点「扫码登录」时拉起，卸载插件会把残留窗口和临时 profile 一起收掉。
 
@@ -261,7 +285,7 @@ print(client.chat.completions.create(
 
 - 本项目仅供个人学习和研究使用，只驱动使用者自己的账号在本机调用，请勿用于商业用途。
 - 使用者需遵守各平台的服务条款；因使用本项目产生的账号限制、服务中断等后果由使用者自行承担。
-- 本项目与 WorkBuddy / 腾讯、华为云 CodeArts、Meoo 秒悟、SCNet、WPS 灵犀、商汤小浣熊 / 商汤均无关联，未获授权或认可；文中出现的名称仅用于描述兼容关系，商标权利归各自所有。
+- 本项目与 WorkBuddy / 腾讯、华为云 CodeArts、Meoo 秒悟、SCNet、WPS 灵犀、商汤小浣熊 / 商汤、豆包 / 字节跳动均无关联，未获授权或认可；文中出现的名称仅用于描述兼容关系，商标权利归各自所有。
 - 项目按 MIT 许可证发布，不提供保修。
 
 ## 致谢
@@ -276,6 +300,7 @@ print(client.chat.completions.create(
 | SCNet | [Phoeky/dsh-scnet-connect](https://github.com/Phoeky/dsh-scnet-connect) | 手机号+验证码登录、SCNet-Max 基座实测结论、四类请求抖动归一化 |
 | WPS 灵犀 | [xinstart-1/dsh-connect-lingxi](https://github.com/xinstart-1/dsh-connect-lingxi) | 独立浏览器 profile 登录、三步握手与 SSE 翻译、请求体归一 |
 | 商汤小浣熊 | [zhlcba/dsh-raccoon-connect](https://github.com/zhlcba/dsh-raccoon-connect) | 上游协议实测记录（`docs/upstream-protocol.md`）、错误码分类、模型识图实测结论、目录 `billing_*` 字段解析 |
+| 豆包 | [jackleo/dsh-connect-doubao-macos](https://github.com/castiel0101/dsh-connect-doubao-macos) | 私有三行帧协议、生图技能别名、逐模型思考档、风控码分类、浏览器扫码 cookie 与本机密封格式 |
 
 以上项目均为 MIT 开源。相关算法和实测结论的著作权归各自原作者。
 

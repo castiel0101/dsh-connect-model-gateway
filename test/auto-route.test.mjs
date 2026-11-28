@@ -230,6 +230,48 @@ function makeAdapter(ctx) {
   assert.equal(secondCalled, false, '已经输出内容的这一轮不能重放')
 }
 
+// ---------- 5b. 只吐过思考过程后截断：仍可换候选（reasoning 不算已交付内容） ----------
+{
+  cooling.clear()
+  let secondCalled = false
+  const reasoning = (value) => ({ type: 'reasoning-delta', index: 0, text: value })
+  const { ctx } = fakeHost({
+    // 推理模型：思考到一半上游截断（没有 finish，也没有正文）
+    'alpha|m-1': async function* () {
+      yield reasoning('我先想想这个问题……')
+      // 没有 finish，也没有 text-delta
+    },
+    'alpha|m-3': async function* () { secondCalled = true; yield text('换个候选的答案'); yield stop },
+  })
+  const chunks = await collect(makeAdapter(ctx).stream({ provider: 'auto', model: AUTO_MODEL, messages: [] }))
+  assert.equal(secondCalled, true, '思考阶段截断必须能换候选，否则用户只看到「本轮运行失败」')
+  const joined = chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('')
+  assert.equal(joined, '换个候选的答案')
+  assert.equal(chunks.at(-1).reason.kind, 'stop')
+  // 前一个候选的思考片段不能漏给界面（它属于被放弃的那次尝试）
+  const leaked = chunks.filter((c) => c.type === 'reasoning-delta').map((c) => c.text).join('')
+  assert.equal(leaked, '', '被放弃候选的思考过程不能出现在结果里')
+}
+
+// ---------- 5c. 思考后正文已吐出再截断：锁定当前候选，不重放 ----------
+{
+  cooling.clear()
+  let secondCalled = false
+  const reasoning = (value) => ({ type: 'reasoning-delta', index: 0, text: value })
+  const { ctx } = fakeHost({
+    'alpha|m-1': async function* () {
+      yield reasoning('想好了')
+      yield text('正文已经出了')
+      // 没有 finish
+    },
+    'alpha|m-3': async function* () { secondCalled = true; yield text('不该出现'); yield stop },
+  })
+  const chunks = await collect(makeAdapter(ctx).stream({ provider: 'auto', model: AUTO_MODEL, messages: [] }))
+  assert.equal(secondCalled, false, '正文已出就不能重放，否则界面会出现两段回答')
+  const joined = chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('')
+  assert.equal(joined, '正文已经出了')
+}
+
 // ---------- 6. 策略不勾的码不切换 ----------
 {
   cooling.clear()
